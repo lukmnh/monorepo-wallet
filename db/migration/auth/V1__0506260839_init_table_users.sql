@@ -1,4 +1,4 @@
-CREATE TABLE wallet.users (
+CREATE TABLE auth.users (
                        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                        username    VARCHAR(50) NOT NULL UNIQUE,
                        email       VARCHAR(100) NOT NULL UNIQUE,
@@ -8,5 +8,5 @@ CREATE TABLE wallet.users (
                        updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_users_username ON wallet.users(username);
-CREATE INDEX idx_users_email ON wallet.users(email);
+CREATE INDEX idx_users_username ON auth.users(username);
+CREATE INDEX idx_users_email ON auth.users(email);
