@@ -122,6 +122,7 @@ public class AuthServiceImpl implements AuthService {
         return new TokenResponse(
                 accessToken,
                 refreshTokenStr,
+                String.valueOf(user.getId()),
                 jwtService.getAccessExpirySeconds(),
                 "Bearer"
         );

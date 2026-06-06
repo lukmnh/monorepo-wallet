@@ -1,4 +1,4 @@
-package com.gpay.auth.filter;
+package com.gpay.wallets.filter;
 
 import jakarta.servlet.*;
 import jakarta.servlet.http.HttpServletRequest;
@@ -27,11 +27,6 @@ public class TraceFilter implements Filter {
         }
         MDC.put("traceId", traceId);
         httpResponse.setHeader(TRACE_ID_HEADER, traceId);
-        
-        String userId = MDC.get("userId");
-        if (userId != null) {
-            httpResponse.setHeader("X-User-Id", userId);
-        }
 
         try {
             chain.doFilter(request, response);

@@ -40,6 +40,7 @@ public class AuthDTO {
     public record TokenResponse(
             String accessToken,
             String refreshToken,
+            String userId,
             long accessExpiresIn,
             String tokenType
     ) {}
