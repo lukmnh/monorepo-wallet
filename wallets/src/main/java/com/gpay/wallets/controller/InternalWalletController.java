@@ -1,7 +1,7 @@
 package com.gpay.wallets.controller;
 
-import com.gpay.auth.dto.AuthDTO.ApiResponse;
 import com.gpay.wallets.dto.WalletDTO;
+import com.gpay.wallets.dto.WalletDTO.ApiResponse;
 import com.gpay.wallets.dto.WalletDTO.BalanceResponse;
 import com.gpay.wallets.service.WalletService;
 import jakarta.validation.Valid;

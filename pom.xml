@@ -28,7 +28,7 @@
 	<modules>
 		<module>auth</module>
 		<module>wallets</module>
-<!--		<module>payment-service</module>-->
+		<module>payment</module>
 <!--		<module>audit-service</module>-->
 	</modules>
 
