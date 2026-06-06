@@ -1,0 +1,35 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: wallets-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/wallet
+    username: postgres
+    password: anime021
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 2
+      connection-timeout: 30000
+    jpa:
+      hibernate:
+        ddl-auto: validate
+      show-sql: false
+      properties:
+        hibernate:
+          dialect: org.hibernate.dialect.PostgreSQLDialect
+          format_sql: false
+
+jwt:
+  secret: m6GHGeZFEane8Pqkdzi+x4eFdLcrbM2xnF6fTRZRkKOZ4ZuWQ8TmFBAPtaozq3JLwItRfLnLzxMEha5TKSWxRQ==
+
+internal:
+  api-key: 8d25b7ce16d1b20fb873c3726ae2251479d851571254bddba9de00a663f3313e
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] [traceId=%X{traceId}] [userId=%X{userId}] %-5level %logger{36} - %msg%n"
+  level:
+    com.gpay: INFO
