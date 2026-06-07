@@ -1,3 +1,51 @@
+server:
+  port: 8083
+
 spring:
   application:
     name: payment
+  datasource:
+    url: jdbc:postgresql://localhost:5432/wallet
+    username: postgres
+    password: anime021
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+    jpa:
+      hibernate:
+        ddl-auto: validate
+      show-sql: false
+      properties:
+        hibernate:
+          dialect: org.hibernate.dialect.PostgreSQLDialect
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: Q+fzdVR7nxUjjs7rIakqM/ya8FYLRpXG79E7qOqc4X8=
+      timeout: 2000ms
+
+jwt:
+  secret: m6GHGeZFEane8Pqkdzi+x4eFdLcrbM2xnF6fTRZRkKOZ4ZuWQ8TmFBAPtaozq3JLwItRfLnLzxMEha5TKSWxRQ==
+
+internal:
+  api-key: 8d25b7ce16d1b20fb873c3726ae2251479d851571254bddba9de00a663f3313e
+
+services:
+  wallet-url: http://localhost:8082
+#   audit-url: ${AUDIT_SERVICE_URL:http://localhost:8084}
+  payment-gateway-url: http://localhost:8085
+
+payment:
+  mock-gateway-secret: 05dd35ec1cb04f9c4059da04af24479daeab3df03997d071da714e2dfab9809b
+  daily-transfer-limit: 1000
+  rate-limit-per-minute: 5
+  topup-timeout-seconds: 5
+  pending-expire-minutes: 60
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] [traceId=%X{traceId}] [userId=%X{userId}] %-5level %logger{36} - %msg%n"
+  level:
+    com.gpay: INFO

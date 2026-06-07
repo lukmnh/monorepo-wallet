@@ -30,6 +30,7 @@
 		<module>wallets</module>
 		<module>payment</module>
 <!--		<module>audit-service</module>-->
+		<module>paymentgateway</module>
 	</modules>
 
 	<dependencyManagement>

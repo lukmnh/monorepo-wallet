@@ -1,0 +1,16 @@
+server:
+  port: 8085
+
+spring:
+  application:
+    name: paymentgateway
+
+gateway:
+  secret: 05dd35ec1cb04f9c4059da04af24479daeab3df03997d071da714e2dfab9809b
+  webhook-url: localhost:8083/api/v1/webhook/topup
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+  level:
+    com.gpay: INFO

@@ -1,4 +1,4 @@
-package com.gpay.auth.filter;
+package com.gpay.payment.filter;
 
 import jakarta.servlet.*;
 import jakarta.servlet.http.HttpServletRequest;
@@ -13,7 +13,6 @@ import java.util.UUID;
 @Component
 @Order(1)
 public class TraceFilter implements Filter {
-
     public static final String TRACE_ID_HEADER = "X-Trace-Id";
 
     @Override
