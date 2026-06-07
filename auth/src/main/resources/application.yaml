@@ -5,9 +5,9 @@ spring:
   application:
     name: auth-service
   datasource:
-    url: jdbc:postgresql://localhost:5432/wallet
-    username: postgres
-    password: anime021
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 10
@@ -20,12 +20,11 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
-        format_sql: false
 
 jwt:
-  secret: m6GHGeZFEane8Pqkdzi+x4eFdLcrbM2xnF6fTRZRkKOZ4ZuWQ8TmFBAPtaozq3JLwItRfLnLzxMEha5TKSWxRQ==
-  access-expiry-minutes: 15
-  refresh-expiry-days: 7
+  secret: ${JWT_SECRET}
+  access-expiry-minutes: ${JWT_ACCESS_EXPIRY_MINUTES}
+  refresh-expiry-days: ${JWT_REFRESH_EXPIRY_DAYS}
 
 logging:
   pattern:
@@ -33,4 +32,3 @@ logging:
   level:
     com.gpay: INFO
     org.springframework.security: WARN
-

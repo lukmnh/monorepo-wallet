@@ -5,9 +5,9 @@ spring:
   application:
     name: payment
   datasource:
-    url: jdbc:postgresql://localhost:5432/wallet
-    username: postgres
-    password: anime021
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 20
@@ -21,28 +21,28 @@ spring:
         dialect: org.hibernate.dialect.PostgreSQLDialect
   data:
     redis:
-      host: localhost
-      port: 6379
-      password: Q+fzdVR7nxUjjs7rIakqM/ya8FYLRpXG79E7qOqc4X8=
+      host: ${SPRING_REDIS_HOST:localhost}
+      port: ${SPRING_REDIS_PORT:6379}
+      password: ${SPRING_REDIS_PASSWORD}
       timeout: 2000ms
 
 jwt:
-  secret: m6GHGeZFEane8Pqkdzi+x4eFdLcrbM2xnF6fTRZRkKOZ4ZuWQ8TmFBAPtaozq3JLwItRfLnLzxMEha5TKSWxRQ==
+  secret: ${JWT_SECRET}
 
 internal:
-  api-key: 8d25b7ce16d1b20fb873c3726ae2251479d851571254bddba9de00a663f3313e
+  api-key: ${INTERNAL_API_KEY}
 
 services:
-  wallet-url: http://localhost:8082
-  audit-url: http://localhost:8084
-  payment-gateway-url: http://localhost:8085
+  wallet-url: ${WALLET_SERVICE_URL:http://localhost:8082}
+  audit-url: ${AUDIT_SERVICE_URL:http://localhost:8084}
+  payment-gateway-url: ${PAYMENT_GATEWAY_URL:http://localhost:8085}
 
 payment:
-  mock-gateway-secret: 05dd35ec1cb04f9c4059da04af24479daeab3df03997d071da714e2dfab9809b
-  daily-transfer-limit: 1000
-  rate-limit-per-minute: 5
-  topup-timeout-seconds: 5
-  pending-expire-minutes: 60
+  mock-gateway-secret: ${MOCK_GATEWAY_SECRET}
+  daily-transfer-limit: ${DAILY_TRANSFER_LIMIT:10000000}
+  rate-limit-per-minute: ${PAYMENT_RATE_LIMIT_PER_MINUTE:5}
+  topup-timeout-seconds: ${TOPUP_TIMEOUT_SECONDS:5}
+  pending-expire-minutes: ${PENDING_EXPIRE_MINUTES:60}
 
 logging:
   pattern:

@@ -10,10 +10,6 @@ CREATE TABLE wallet.mutations (
                                   created_at      TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_mutations_wallet_id ON wallet.mutations(wallet_id);
-CREATE INDEX idx_mutations_created_at ON wallet.mutations(created_at DESC);
-CREATE INDEX idx_mutations_reference_id ON wallet.mutations(reference_id);
-
-CREATE INDEX idx_mutations_wallet_id ON wallet.mutations(wallet_id);
-CREATE INDEX idx_mutations_created_at ON wallet.mutations(created_at DESC);
-CREATE INDEX idx_mutations_reference_id ON wallet.mutations(reference_id);
+CREATE INDEX IF NOT EXISTS idx_mutations_wallet_id ON wallet.mutations(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_mutations_created_at ON wallet.mutations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mutations_reference_id ON wallet.mutations(reference_id);

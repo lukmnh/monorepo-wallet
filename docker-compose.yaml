@@ -1,0 +1,156 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migration:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gpay-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gpay-network
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth/Dockerfile
+    container_name: auth-service
+    env_file: .env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}?currentSchema=auth
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ACCESS_EXPIRY_MINUTES: ${JWT_ACCESS_EXPIRY_MINUTES}
+      JWT_REFRESH_EXPIRY_DAYS: ${JWT_REFRESH_EXPIRY_DAYS}
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - gpay-network
+
+  wallet-service:
+    build:
+      context: .
+      dockerfile: wallets/Dockerfile
+    container_name: wallet-service
+    env_file: .env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}?currentSchema=wallet
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - gpay-network
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
+    container_name: payment-service
+    env_file: .env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}?currentSchema=payment
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: 6379
+      SPRING_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+      WALLET_SERVICE_URL: http://wallet-service:8082
+      AUDIT_SERVICE_URL: http://audit-service:8084
+      PAYMENT_GATEWAY_URL: http://mock-gateway:8085
+      MOCK_GATEWAY_SECRET: ${MOCK_GATEWAY_SECRET}
+      DAILY_TRANSFER_LIMIT: ${DAILY_TRANSFER_LIMIT}
+      PAYMENT_RATE_LIMIT_PER_MINUTE: 5
+      TOPUP_TIMEOUT_SECONDS: 5
+      PENDING_EXPIRE_MINUTES: ${PENDING_EXPIRE_MINUTES}
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      wallet-service:
+        condition: service_started
+    networks:
+      - gpay-network
+
+  audit-service:
+    build:
+      context: .
+      dockerfile: auditlog/Dockerfile
+    container_name: audit-service
+    env_file: .env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}?currentSchema=audit
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+    ports:
+      - "8084:8084"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - gpay-network
+
+  mock-gateway:
+    build:
+      context: .
+      dockerfile: paymentgateway/Dockerfile
+    container_name: mock-gateway
+    env_file: .env
+    environment:
+      MOCK_GATEWAY_SECRET: ${MOCK_GATEWAY_SECRET}
+      PAYMENT_SERVICE_WEBHOOK_URL: http://payment-service:8083/api/v1/webhook/topup
+    ports:
+      - "8085:8085"
+    depends_on:
+      payment-service:
+        condition: service_started
+    networks:
+      - gpay-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  gpay-network:
+    driver: bridge

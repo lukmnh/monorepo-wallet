@@ -5,9 +5,9 @@ spring:
   application:
     name: auditlog
   datasource:
-    url: jdbc:postgresql://localhost:5432/wallet
-    username: postgres
-    password: anime021
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
     driver-class-name: org.postgresql.Driver
     hikari:
       maximum-pool-size: 10
@@ -20,10 +20,9 @@ spring:
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
-        format_sql: false
 
 internal:
-  api-key: 8d25b7ce16d1b20fb873c3726ae2251479d851571254bddba9de00a663f3313e
+  api-key: ${INTERNAL_API_KEY:8d25b7ce16d1b20fb873c3726ae2251479d851571254bddba9de00a663f3313e}
 
 logging:
   pattern:
