@@ -1,5 +1,6 @@
 package com.gpay.payment.service.Impl;
 
+import com.gpay.payment.client.AuditClient;
 import com.gpay.payment.client.PaymentGatewayClient;
 import com.gpay.payment.constant.TransactionStatus;
 import com.gpay.payment.constant.TransactionType;
@@ -29,6 +30,7 @@ public class TopupServiceImpl implements TopupService {
     private final TransactionRepository transactionRepository;
     private final TopUpRequestRepository topupRequestRepository;
     private final PaymentGatewayClient gatewayClient;
+    private final AuditClient auditClient;
 
     @Value("${payment.pending-expire-minutes:60}")
     private int pendingExpireMinutes;
@@ -36,7 +38,7 @@ public class TopupServiceImpl implements TopupService {
     @Override
     @Transactional
     public TransactionResponse topup(UUID userId, PaymentDTO.TopupRequest request, String idempotencyKey) {
-    //    long start = System.currentTimeMillis();
+        long start = System.currentTimeMillis();
 
         Transactions txn = Transactions.builder()
                 .idempotencyKey(idempotencyKey)
@@ -67,9 +69,9 @@ public class TopupServiceImpl implements TopupService {
             log.error("Gateway error for txnId={}: {}", txn.getId(), e.getMessage());
         }
 
-//        long duration = System.currentTimeMillis() - start;
-//        auditClient.log(userId, txn.getId(), "TOPUP_INITIATED", "PENDING",
-//                Map.of("amount", request.amount()), null, duration, null);
+        long duration = System.currentTimeMillis() - start;
+        auditClient.log(userId, txn.getId(), "TOPUP_INITIATED", "PENDING",
+                Map.of("amount", request.amount()), null, duration, null);
 
         return toResponse(txn);
     }

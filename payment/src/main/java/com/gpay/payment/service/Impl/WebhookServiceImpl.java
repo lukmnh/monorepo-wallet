@@ -1,5 +1,6 @@
 package com.gpay.payment.service.Impl;
 
+import com.gpay.payment.client.AuditClient;
 import com.gpay.payment.client.WalletClient;
 import com.gpay.payment.constant.TransactionStatus;
 import com.gpay.payment.dto.PaymentDTO.WebhookPayload;
@@ -28,7 +29,7 @@ public class WebhookServiceImpl implements WebhookService {
     private final TransactionRepository transactionRepository;
     private final TopUpRequestRepository topupRequestRepository;
     private final WalletClient walletClient;
-//    private final AuditClient auditClient;
+    private final AuditClient auditClient;
 
     @Value("${payment.mock-gateway-secret}")
     private String gatewaySecret;
@@ -71,9 +72,9 @@ public class WebhookServiceImpl implements WebhookService {
         topupRequestRepository.save(topupReq);
         transactionRepository.save(txn);
 
-//        long duration = System.currentTimeMillis() - start;
-//        auditClient.log(txn.getUserId(), txn.getId(), "TOPUP_WEBHOOK",
-//                txn.getStatus().name(), payload, null, duration, null);
+        long duration = System.currentTimeMillis() - start;
+        auditClient.log(txn.getUserId(), txn.getId(), "TOPUP_WEBHOOK",
+                txn.getStatus().name(), payload, null, duration, null);
     }
 
 

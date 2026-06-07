@@ -12,13 +12,13 @@ spring:
     hikari:
       maximum-pool-size: 20
       minimum-idle: 5
-    jpa:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
       hibernate:
-        ddl-auto: validate
-      show-sql: false
-      properties:
-        hibernate:
-          dialect: org.hibernate.dialect.PostgreSQLDialect
+        dialect: org.hibernate.dialect.PostgreSQLDialect
   data:
     redis:
       host: localhost
@@ -34,7 +34,7 @@ internal:
 
 services:
   wallet-url: http://localhost:8082
-#   audit-url: ${AUDIT_SERVICE_URL:http://localhost:8084}
+  audit-url: http://localhost:8084
   payment-gateway-url: http://localhost:8085
 
 payment:

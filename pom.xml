@@ -29,7 +29,7 @@
 		<module>auth</module>
 		<module>wallets</module>
 		<module>payment</module>
-<!--		<module>audit-service</module>-->
+		<module>auditlog</module>
 		<module>paymentgateway</module>
 	</modules>
 

@@ -1,5 +1,6 @@
 package com.gpay.payment.service.Impl;
 
+import com.gpay.payment.client.AuditClient;
 import com.gpay.payment.client.WalletClient;
 import com.gpay.payment.constant.TransactionStatus;
 import com.gpay.payment.constant.TransactionType;
@@ -27,13 +28,13 @@ public class TransferServiceImpl implements TransferService {
     private final TransactionRepository transactionRepository;
     private final TransferRequestRepository transferRequestRepository;
     private final WalletClient walletClient;
-//    private final AuditClient auditClient;
+    private final AuditClient auditClient;
     private final RateLimitService rateLimitService;
 
     @Override
     @Transactional
     public TransactionResponse transfer(UUID fromUserId, PaymentDTO.TransferRequest request, String idempotencyKey) {
-//        long start = System.currentTimeMillis();
+        long start = System.currentTimeMillis();
 
         if (fromUserId.equals(request.toUserId())) {
             throw new PaymentException.InvalidTransferException("Cannot transfer to yourself");
@@ -90,10 +91,10 @@ public class TransferServiceImpl implements TransferService {
             throw new PaymentException.TransferFailedException("Transfer failed: " + e.getMessage());
         }
 
-//        long duration = System.currentTimeMillis() - start;
-//        auditClient.log(fromUserId, txn.getId(), "TRANSFER", txn.getStatus().name(),
-//                java.util.Map.of("toUserId", request.toUserId(), "amount", request.amount()),
-//                null, duration, null);
+        long duration = System.currentTimeMillis() - start;
+        auditClient.log(fromUserId, txn.getId(), "TRANSFER", txn.getStatus().name(),
+                java.util.Map.of("toUserId", request.toUserId(), "amount", request.amount()),
+                null, duration, null);
 
         return new TransactionResponse(txn.getId(), txn.getType(), txn.getStatus(),
                 txn.getAmount(), txn.getDescription(), txn.getCreatedAt());

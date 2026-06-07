@@ -13,14 +13,14 @@ spring:
       maximum-pool-size: 10
       minimum-idle: 2
       connection-timeout: 30000
-    jpa:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
       hibernate:
-        ddl-auto: validate
-      show-sql: false
-      properties:
-        hibernate:
-          dialect: org.hibernate.dialect.PostgreSQLDialect
-          format_sql: false
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: false
 
 jwt:
   secret: m6GHGeZFEane8Pqkdzi+x4eFdLcrbM2xnF6fTRZRkKOZ4ZuWQ8TmFBAPtaozq3JLwItRfLnLzxMEha5TKSWxRQ==
