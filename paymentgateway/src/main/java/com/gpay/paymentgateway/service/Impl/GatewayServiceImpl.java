@@ -19,9 +19,8 @@ import java.util.UUID;
 
 @Service
 @Slf4j
-@RequiredArgsConstructor
 public class GatewayServiceImpl implements GatewayService {
-    private final RestTemplate restTemplate;
+    private final RestTemplate restTemplate = new RestTemplate();
 
     @Value("${gateway.secret}")
     private String secret;
