@@ -1,5 +1,6 @@
 package com.gpay.auth.service.Impl;
 
+import com.gpay.auth.client.WalletClient;
 import com.gpay.auth.dto.AuthDTO.*;
 import com.gpay.auth.entity.RefreshToken;
 import com.gpay.auth.entity.Users;
@@ -8,6 +9,7 @@ import com.gpay.auth.repository.RefreshTokenRepository;
 import com.gpay.auth.repository.UserRepository;
 import com.gpay.auth.service.AuthService;
 import com.gpay.auth.service.common.JwtService;
+import com.gpay.auth.service.common.LoginAttemptService;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -36,17 +38,23 @@ public class AuthServiceImpl implements AuthService {
     private final RefreshTokenRepository refreshTokenRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwtService;
+    private final LoginAttemptService loginAttemptService;
+    private final WalletClient walletClient;
     // Compared against when the username does not exist, so both paths cost one BCrypt check
     private final String dummyPasswordHash;
 
     public AuthServiceImpl(UserRepository userRepository,
                            RefreshTokenRepository refreshTokenRepository,
                            PasswordEncoder passwordEncoder,
-                           JwtService jwtService) {
+                           JwtService jwtService,
+                           LoginAttemptService loginAttemptService,
+                           WalletClient walletClient) {
         this.userRepository = userRepository;
         this.refreshTokenRepository = refreshTokenRepository;
         this.passwordEncoder = passwordEncoder;
         this.jwtService = jwtService;
+        this.loginAttemptService = loginAttemptService;
+        this.walletClient = walletClient;
         this.dummyPasswordHash = passwordEncoder.encode("timing-equalizer");
     }
 
@@ -75,7 +83,11 @@ public class AuthServiceImpl implements AuthService {
                 .password(passwordEncoder.encode(request.password()))
                 .build();
 
-        user = userRepository.save(user);
+        // Flush now so a duplicate fails (409) before wallet-service is called
+        user = userRepository.saveAndFlush(user);
+        // Inside the TX on purpose: if provisioning fails the user row rolls back, so no user exists without a wallet.
+        // wallet-service create is idempotent, so a client retry after a 503 is safe.
+        walletClient.createWallet(user.getId());
         log.info("User registered: username={}", user.getUsername());
 
         return new RegisterResponse(
@@ -87,20 +99,27 @@ public class AuthServiceImpl implements AuthService {
 
     @Override
     @Transactional
-    public TokenResponse login(LoginRequest request) {
+    public TokenResponse login(LoginRequest request, String clientIp) {
+        String username = normalize(request.username());
+        // Checked before the password: a locked account is rejected even with the right password
+        loginAttemptService.assertNotBlocked(username, clientIp);
+
         // Such a password can never match a stored hash; reject before BCrypt throws
         if (exceedsBcryptLimit(request.password())) {
+            loginAttemptService.recordFailure(username, clientIp);
             throw new AuthException.InvalidCredentialsException("Invalid username or password");
         }
 
-        Users user = userRepository.findByUsername(normalize(request.username())).orElse(null);
+        Users user = userRepository.findByUsername(username).orElse(null);
 
         // Always run BCrypt: response time must not reveal whether the username exists
         boolean passwordValid = passwordEncoder.matches(
                 request.password(), user != null ? user.getPassword() : dummyPasswordHash);
         if (user == null || !passwordValid) {
+            loginAttemptService.recordFailure(username, clientIp);
             throw new AuthException.InvalidCredentialsException("Invalid username or password");
         }
+        loginAttemptService.recordSuccess(username);
 
         // Account status is only revealed to someone who already proved the password
         if (!user.isActive()) {

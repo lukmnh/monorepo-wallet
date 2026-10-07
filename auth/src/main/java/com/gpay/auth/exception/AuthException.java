@@ -24,4 +24,17 @@ public class AuthException {
     public static class InvalidPasswordException extends RuntimeException {
         public InvalidPasswordException(String message) { super(message); }
     }
+
+    public static class TooManyLoginAttemptsException extends RuntimeException {
+        private final long retryAfterSeconds;
+        public TooManyLoginAttemptsException(String message, long retryAfterSeconds) {
+            super(message);
+            this.retryAfterSeconds = retryAfterSeconds;
+        }
+        public long getRetryAfterSeconds() { return retryAfterSeconds; }
+    }
+
+    public static class WalletProvisioningException extends RuntimeException {
+        public WalletProvisioningException(String message) { super(message); }
+    }
 }

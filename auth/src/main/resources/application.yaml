@@ -14,18 +14,38 @@ spring:
       minimum-idle: 2
       connection-timeout: 30000
   jpa:
+    open-in-view: false
     hibernate:
       ddl-auto: validate
     show-sql: false
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
+  data:
+    redis:
+      host: ${SPRING_REDIS_HOST:localhost}
+      port: ${SPRING_REDIS_PORT:6379}
+      password: ${SPRING_REDIS_PASSWORD}
+      timeout: 2000ms
 
 jwt:
-  secret: ${JWT_SECRET}
+  # RS256 PKCS#8 PEM private key; only auth-service has it (scripts/generate-jwt-keys.sh)
+  private-key-path: ${JWT_PRIVATE_KEY_PATH:keys/jwt_private.pem}
   issuer: ${JWT_ISSUER:gpay-auth}
   access-expiry-minutes: ${JWT_ACCESS_EXPIRY_MINUTES}
   refresh-expiry-days: ${JWT_REFRESH_EXPIRY_DAYS}
+  cleanup-cron: ${JWT_CLEANUP_CRON:0 0 3 * * *}
+
+login:
+  max-attempts-per-user: ${LOGIN_MAX_ATTEMPTS_PER_USER:5}
+  max-attempts-per-ip: ${LOGIN_MAX_ATTEMPTS_PER_IP:20}
+  lock-minutes: ${LOGIN_LOCK_MINUTES:15}
+
+services:
+  wallet-url: ${WALLET_SERVICE_URL:http://localhost:8082}
+
+internal:
+  api-key: ${INTERNAL_API_KEY}
 
 logging:
   pattern:

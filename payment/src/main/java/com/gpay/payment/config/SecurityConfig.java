@@ -6,12 +6,12 @@ import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.security.web.authentication.HttpStatusEntryPoint;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
 @Configuration
@@ -29,8 +29,12 @@ public class SecurityConfig {
                         .requestMatchers("/api/v1/webhook/**").permitAll()
                         .anyRequest().authenticated()
                 )
-                // Missing/invalid token => 401, not the default 403
-                .exceptionHandling(e -> e.authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)))
+                // Missing/invalid token => 401 with the standard JSON envelope (default would be an empty 403)
+                .exceptionHandling(e -> e.authenticationEntryPoint((request, response, ex) -> {
+                    response.setStatus(HttpStatus.UNAUTHORIZED.value());
+                    response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+                    response.getWriter().write("{\"success\":false,\"message\":\"Unauthorized\",\"data\":null}");
+                }))
                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
         return http.build();
     }

@@ -29,12 +29,11 @@ public class WalletServiceImpl implements WalletService {
     @Override
     @Transactional
     public BalanceResponse createWallet(UUID userId) {
-        if (walletRepository.findByUserId(userId).isPresent()) {
-            throw new WalletException.WalletAlreadyExistsException("Wallet already exists for user: " + userId);
-        }
-        Wallets wallet = Wallets.builder().userId(userId).build();
-        wallet = walletRepository.save(wallet);
-        log.info("Wallet created for userId={}", userId);
+        // Idempotent: auth-service calls this on every registration attempt, retries must not fail
+        walletRepository.insertIfAbsent(userId);
+        Wallets wallet = walletRepository.findByUserId(userId)
+                .orElseThrow(() -> new WalletException.WalletNotFoundException("Wallet not found for userId: " + userId));
+        log.info("Wallet ensured for userId={}", userId);
         return toBalanceResponse(wallet);
     }
 

@@ -5,6 +5,7 @@ import com.gpay.auth.dto.AuthDTO.ApiResponse;
 import com.gpay.auth.dto.AuthDTO.RegisterResponse;
 import com.gpay.auth.dto.AuthDTO.TokenResponse;
 import com.gpay.auth.service.AuthService;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -31,9 +32,11 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    public ResponseEntity<ApiResponse<TokenResponse>> login(@Valid @RequestBody AuthDTO.LoginRequest request) {
+    public ResponseEntity<ApiResponse<TokenResponse>> login(@Valid @RequestBody AuthDTO.LoginRequest request,
+                                                            HttpServletRequest httpRequest) {
         log.info("Login attempt for username={}", request.username());
-        TokenResponse response = authService.login(request);
+        // Direct peer address. Behind a reverse proxy, enable server.forward-headers-strategy so this is the client IP
+        TokenResponse response = authService.login(request, httpRequest.getRemoteAddr());
         return ResponseEntity.ok(ApiResponse.ok("Login successful", response));
     }
 

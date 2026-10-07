@@ -10,7 +10,6 @@ import com.gpay.payment.exception.PaymentException;
 import com.gpay.payment.repository.TopUpRequestRepository;
 import com.gpay.payment.repository.TransactionRepository;
 import com.gpay.payment.service.WebhookService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -19,20 +18,36 @@ import org.springframework.transaction.annotation.Transactional;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.util.HexFormat;
+import java.util.UUID;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class WebhookServiceImpl implements WebhookService {
     private final TransactionRepository transactionRepository;
     private final TopUpRequestRepository topupRequestRepository;
     private final WalletClient walletClient;
     private final AuditClient auditClient;
+    private final byte[] gatewaySecret;
 
-    @Value("${payment.mock-gateway-secret}")
-    private String gatewaySecret;
+    public WebhookServiceImpl(TransactionRepository transactionRepository,
+                              TopUpRequestRepository topupRequestRepository,
+                              WalletClient walletClient,
+                              AuditClient auditClient,
+                              @Value("${payment.mock-gateway-secret}") String gatewaySecret) {
+        this.transactionRepository = transactionRepository;
+        this.topupRequestRepository = topupRequestRepository;
+        this.walletClient = walletClient;
+        this.auditClient = auditClient;
+        // An empty HMAC key would make signatures forgeable by anyone
+        if (gatewaySecret == null || gatewaySecret.isBlank()) {
+            throw new IllegalStateException("MOCK_GATEWAY_SECRET must be set");
+        }
+        this.gatewaySecret = gatewaySecret.getBytes(StandardCharsets.UTF_8);
+    }
 
     @Override
     @Transactional
@@ -41,59 +56,80 @@ public class WebhookServiceImpl implements WebhookService {
 
         validateSignature(payload, signature);
 
+        // gateway_ref may not be stored yet if the webhook beat the initiate response: fall back to our own id
         TopupRequest topupReq = topupRequestRepository.findByGatewayRef(payload.gatewayRef())
-                .orElseThrow(() -> new PaymentException.WebhookException("Unknown gatewayRef: " + payload.gatewayRef()));
+                .or(() -> topupRequestRepository.findByTransactionId(payload.transactionId()))
+                .orElseThrow(() -> new PaymentException.WebhookException("Unknown top-up: " + payload.gatewayRef()));
 
-        Transactions txn = topupReq.getTransaction();
+        UUID txnId = topupReq.getTransaction().getId();
+        if (!txnId.equals(payload.transactionId())
+                || (topupReq.getGatewayRef() != null && !topupReq.getGatewayRef().equals(payload.gatewayRef()))) {
+            throw new PaymentException.WebhookException("gatewayRef/transactionId mismatch");
+        }
 
-        // if already resolved, skip
-        if (txn.getStatus() != TransactionStatus.PENDING) {
-            log.info("Webhook for already-resolved txnId={} status={}, skipping",
-                    txn.getId(), txn.getStatus());
+        // Row lock: duplicate deliveries and the expiry job are serialized on this transaction
+        Transactions txn = transactionRepository.findByIdForUpdate(txnId).orElseThrow();
+
+        if (txn.getAmount().compareTo(payload.amount()) != 0) {
+            log.warn("Webhook amount mismatch txnId={} expected={} got={}", txnId, txn.getAmount(), payload.amount());
+            throw new PaymentException.WebhookException("Amount mismatch");
+        }
+
+        if (txn.getStatus() == TransactionStatus.SUCCESS || txn.getStatus() == TransactionStatus.FAILED) {
+            log.info("Webhook for already-resolved txnId={} status={}, skipping", txnId, txn.getStatus());
             return;
         }
 
         if ("SUCCESS".equals(payload.status())) {
-            walletClient.credit(
-                    txn.getUserId(),
-                    txn.getAmount(),
-                    txn.getId().toString(),
-                    "Top-up via payment gateway"
-            );
+            // The gateway took the money: credit even if we already EXPIRED it (late callback).
+            // Idempotent on wallet-service by referenceId, so redelivery cannot double-credit.
+            walletClient.credit(txn.getUserId(), txn.getAmount(), txnId.toString(), "Top-up via payment gateway");
+            if (txn.getStatus() == TransactionStatus.EXPIRED) {
+                log.warn("Late SUCCESS webhook for EXPIRED txnId={}, crediting", txnId);
+            }
             txn.setStatus(TransactionStatus.SUCCESS);
-            log.info("Topup SUCCESS txnId={} userId={} amount={}", txn.getId(), txn.getUserId(), txn.getAmount());
-        } else {
+            txn.setFailureReason(null);
+            log.info("Topup SUCCESS txnId={} userId={} amount={}", txnId, txn.getUserId(), txn.getAmount());
+        } else if (txn.getStatus() == TransactionStatus.PENDING) {
             txn.setStatus(TransactionStatus.FAILED);
             txn.setFailureReason("Gateway reported status " + payload.status());
-            log.info("Topup FAILED txnId={} userId={}", txn.getId(), txn.getUserId());
+            log.info("Topup FAILED txnId={} userId={}", txnId, txn.getUserId());
         }
 
+        topupReq.setGatewayRef(payload.gatewayRef());
         topupReq.setCallbackStatus(payload.status());
         topupReq.setWebhookReceivedAt(LocalDateTime.now());
         topupRequestRepository.save(topupReq);
         transactionRepository.save(txn);
 
-        long duration = System.currentTimeMillis() - start;
-        auditClient.log(txn.getUserId(), txn.getId(), "TOPUP_WEBHOOK",
-                txn.getStatus().name(), payload, null, duration, null);
+        auditClient.log(txn.getUserId(), txnId, "TOPUP_WEBHOOK", txn.getStatus().name(), payload, null,
+                System.currentTimeMillis() - start, null);
     }
 
-
+    // Signed fields: gatewayRef:transactionId:status:amount (must match the gateway's WebhookDispatcher)
     private void validateSignature(WebhookPayload payload, String signature) {
+        String data = payload.gatewayRef() + ":" + payload.transactionId() + ":" + payload.status() + ":"
+                + payload.amount().toPlainString();
+        byte[] expected;
         try {
-            String data = payload.gatewayRef() + ":" + payload.status() + ":" + payload.amount().toPlainString();
             Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(gatewaySecret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-            String expected = HexFormat.of().formatHex(mac.doFinal(data.getBytes(StandardCharsets.UTF_8)));
+            mac.init(new SecretKeySpec(gatewaySecret, "HmacSHA256"));
+            expected = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("HMAC-SHA256 unavailable", e);
+        }
 
-            if (!expected.equals(signature)) {
-                log.warn("Invalid webhook signature. Expected={} Got={}", expected, signature);
-                throw new PaymentException.WebhookSignatureException("Invalid webhook signature");
-            }
-        } catch (PaymentException.WebhookSignatureException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new PaymentException.WebhookException("Signature validation error: " + e.getMessage());
+        byte[] provided;
+        try {
+            provided = HexFormat.of().parseHex(signature);
+        } catch (IllegalArgumentException e) {
+            provided = new byte[0];
+        }
+
+        // Constant-time compare; never log the expected value (it is a valid signature for this payload)
+        if (!MessageDigest.isEqual(expected, provided)) {
+            log.warn("Invalid webhook signature gatewayRef={}", payload.gatewayRef());
+            throw new PaymentException.WebhookSignatureException("Invalid webhook signature");
         }
     }
 }

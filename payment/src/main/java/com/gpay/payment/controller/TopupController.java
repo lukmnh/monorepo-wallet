@@ -1,6 +1,6 @@
 package com.gpay.payment.controller;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.gpay.payment.dto.PaymentDTO;
 import com.gpay.payment.dto.PaymentDTO.ApiResponse;
 import com.gpay.payment.dto.PaymentDTO.TransactionResponse;
 import com.gpay.payment.exception.PaymentException;
@@ -25,46 +25,30 @@ public class TopupController {
     private final TopupService topupService;
     private final IdempotencyService idempotencyService;
     private final RateLimitService rateLimitService;
-    private final ObjectMapper objectMapper;
 
     @PostMapping
     public ResponseEntity<ApiResponse<TransactionResponse>> topup(
-            @Valid @RequestBody com.gpay.payment.dto.PaymentDTO.TopupRequest request,
+            @Valid @RequestBody PaymentDTO.TopupRequest request,
             @RequestHeader("X-Idempotency-Key") String idempotencyKey,
-            Authentication auth) throws Exception {
+            Authentication auth) {
 
         UUID userId = UUID.fromString(auth.getName());
 
-        // Rate limit check
-        if (!rateLimitService.checkAndIncrementRateLimit(userId)) {
-            int remaining = rateLimitService.getRemainingRateLimit(userId);
-            throw new PaymentException.RateLimitExceededException(
-                    "Too many requests. Max 5 per minute. Remaining: " + remaining + ". Retry after 60 seconds.");
+        if (!rateLimitService.tryAcquire(userId)) {
+            throw new PaymentException.RateLimitExceededException("Too many payment requests. Max "
+                    + rateLimitService.getLimitPerMinute() + " per minute. Retry after 60 seconds.");
         }
 
-        // Idempotency check
-        if (idempotencyService.exists(userId, idempotencyKey)) {
-            var cached = idempotencyService.getResponse(userId, idempotencyKey);
-            if (cached.isPresent()) {
-                log.info("Duplicate topup request idempotencyKey={}, returning cached response", idempotencyKey);
-                TransactionResponse cachedResp = objectMapper.readValue(cached.get(), TransactionResponse.class);
-                return ResponseEntity.ok(ApiResponse.ok("Duplicate request - returning cached response", cachedResp));
-            }
-
+        // Only blocks concurrent duplicates; a finished request with the same key is replayed by the service
+        String lockToken = idempotencyService.tryLock(userId, idempotencyKey);
+        if (lockToken == null) {
             return ResponseEntity.status(HttpStatus.CONFLICT)
-                    .body(ApiResponse.error("Request is still being processed. Please retry shortly."));
+                    .body(ApiResponse.error("A request with this idempotency key is still being processed. Retry shortly."));
         }
-
-        // try to acquire idempotency lock
-        if (!idempotencyService.tryLock(userId, idempotencyKey)) {
-            return ResponseEntity.status(HttpStatus.CONFLICT)
-                    .body(ApiResponse.error("Duplicate request detected"));
+        try {
+            return TransactionHttp.respond(topupService.topup(userId, request, idempotencyKey), "Top-up");
+        } finally {
+            idempotencyService.release(userId, idempotencyKey, lockToken);
         }
-
-        TransactionResponse response = topupService.topup(userId, request, idempotencyKey);
-        idempotencyService.saveResponse(userId, idempotencyKey, response);
-
-        return ResponseEntity.status(HttpStatus.ACCEPTED)
-                .body(ApiResponse.ok("Top-up initiated. Waiting for payment gateway callback.", response));
     }
 }

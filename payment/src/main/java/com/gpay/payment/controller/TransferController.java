@@ -1,6 +1,5 @@
 package com.gpay.payment.controller;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.gpay.payment.dto.PaymentDTO;
 import com.gpay.payment.dto.PaymentDTO.ApiResponse;
 import com.gpay.payment.dto.PaymentDTO.TransactionResponse;
@@ -26,43 +25,30 @@ public class TransferController {
     private final TransferService transferService;
     private final IdempotencyService idempotencyService;
     private final RateLimitService rateLimitService;
-    private final ObjectMapper objectMapper;
 
     @PostMapping
     public ResponseEntity<ApiResponse<TransactionResponse>> transfer(
             @Valid @RequestBody PaymentDTO.TransferRequest request,
             @RequestHeader("X-Idempotency-Key") String idempotencyKey,
-            Authentication auth) throws Exception {
+            Authentication auth) {
 
         UUID userId = UUID.fromString(auth.getName());
 
-        // Rate limit check
-        if (!rateLimitService.checkAndIncrementRateLimit(userId)) {
-            throw new PaymentException.RateLimitExceededException(
-                    "Too many requests. Max 5 payment requests per minute. Retry after 60 seconds.");
+        if (!rateLimitService.tryAcquire(userId)) {
+            throw new PaymentException.RateLimitExceededException("Too many payment requests. Max "
+                    + rateLimitService.getLimitPerMinute() + " per minute. Retry after 60 seconds.");
         }
 
-        // Idempotency check
-        if (idempotencyService.exists(userId, idempotencyKey)) {
-            var cached = idempotencyService.getResponse(userId, idempotencyKey);
-            if (cached.isPresent()) {
-                log.info("Duplicate transfer request idempotencyKey={}", idempotencyKey);
-                TransactionResponse cachedResp = objectMapper.readValue(cached.get(), TransactionResponse.class);
-                return ResponseEntity.ok(ApiResponse.ok("Duplicate request - returning cached response", cachedResp));
-            }
+        // Only blocks concurrent duplicates; a finished request with the same key is replayed by the service
+        String lockToken = idempotencyService.tryLock(userId, idempotencyKey);
+        if (lockToken == null) {
             return ResponseEntity.status(HttpStatus.CONFLICT)
-                    .body(ApiResponse.error("Request is still being processed."));
+                    .body(ApiResponse.error("A request with this idempotency key is still being processed. Retry shortly."));
         }
-
-        if (!idempotencyService.tryLock(userId, idempotencyKey)) {
-            return ResponseEntity.status(HttpStatus.CONFLICT)
-                    .body(ApiResponse.error("Duplicate request detected"));
+        try {
+            return TransactionHttp.respond(transferService.transfer(userId, request, idempotencyKey), "Transfer");
+        } finally {
+            idempotencyService.release(userId, idempotencyKey, lockToken);
         }
-
-        TransactionResponse response = transferService.transfer(userId, request, idempotencyKey);
-        idempotencyService.saveResponse(userId, idempotencyKey, response);
-
-        return ResponseEntity.ok(ApiResponse.ok("Transfer successful", response));
     }
-
 }

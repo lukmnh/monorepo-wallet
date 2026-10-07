@@ -22,7 +22,11 @@ public class GatewayController {
     @PostMapping("/topup")
     public ResponseEntity<Map<String, Object>> topup(@RequestBody Map<String, Object> request) {
         String transactionId = (String) request.get("transactionId");
-        BigDecimal amount = new BigDecimal(request.get("amount").toString());
+        Object rawAmount = request.get("amount");
+        if (transactionId == null || rawAmount == null) {
+            return ResponseEntity.badRequest().body(Map.of("status", "REJECTED", "message", "transactionId and amount are required"));
+        }
+        BigDecimal amount = new BigDecimal(rawAmount.toString());
         String scenario = (String) request.getOrDefault("scenario", "SUCCESS");
 
         String gatewayRef = gatewayService.initiateTopup(transactionId, amount, scenario);

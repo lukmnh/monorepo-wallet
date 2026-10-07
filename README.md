@@ -1,96 +1,74 @@
-# Wallet — Microservices System
+# GPay Wallet — Microservices
 
-Sistem wallet berbasis microservices yang mendukung top-up via payment gateway, transfer antar user, manajemen saldo, idempotency, rate limiting, dan audit logging.
+Wallet system built from Spring Boot microservices: registration and login, top-up through a (mock) payment gateway, P2P transfer, balance and mutation history, with idempotency, rate limiting and audit logging.
 
----
+**Stack:** Java 21 · Spring Boot 3.5 · PostgreSQL 16 · Redis 7 · Docker Compose
 
-## Arsitektur
+## Documentation
 
-```
-Client
-  │
-  ├──► auth-service    :8081  → Register, Login, Refresh Token, Logout
-  ├──► wallet-service  :8082  → Cek Saldo, Riwayat Mutasi
-  ├──► payment-service :8083  → Top-up, Transfer, Webhook
-  ├──► audit-service   :8084  → Audit Log (internal)
-  └──► payment-gateway :8085  → Simulasi Payment Gateway
-```
-## Cara Menjalankan
+| Document | Read it to… |
+|---|---|
+| [docs/getting-started.md](docs/getting-started.md) | Run the apps step by step, verify, day-to-day commands, run one service from Maven/IDE, upgrade, troubleshoot |
+| [docs/api-examples.md](docs/api-examples.md) | Call every endpoint with copy-paste `curl` examples and real responses |
+| [architecture.md](architecture.md) | Understand services, flows, security model, configuration |
+| [database.md](database.md) | Understand schemas, constraints, Redis keys, migrations |
 
-### Prerequisites
-- Docker & Docker Compose installed
-- Port 8081–8085, 5432–5435, 6379 tersedia
+## Services
 
-### Steps
+| Service | Port | Responsibility |
+|---|---|---|
+| auth-service | 8081 | Register (also creates the wallet), login with brute-force lockout, refresh, logout; signs RS256 tokens |
+| wallet-service | 8082 | Balance, mutation history; internal credit/debit/transfer with row locking |
+| payment-service | 8083 | Top-up, transfer, gateway webhook; idempotency, rate and daily limits, background jobs |
+| audit-service | 8084 | Internal audit log |
+| mock-gateway | 8085 | Simulated payment gateway (`SUCCESS` / `FAILED` / `TIMEOUT`) |
+| postgres / redis | 5432 / 6379 | Storage; host ports configurable in `.env` |
+
+## Quick start
+
+Requires Docker Compose v2, `openssl`, `curl` and `jq`. Full explanation of each step: [docs/getting-started.md](docs/getting-started.md).
 
 ```bash
-# Clone repo
-git clone https://github.com/lukmnh/monorepo-wallet.git
-cd wallet
+# 1. Generate the JWT key pair (keys/ is git-ignored)
+./scripts/generate-jwt-keys.sh
 
-# Copy env file dan isi secrets
+# 2. Create .env with random secrets
 cp .env.example .env
-# Edit .env — ganti semua *_PASSWORD, JWT_SECRET, INTERNAL_API_KEY, MOCK_GATEWAY_SECRET
+for var in DB_PASSWORD REDIS_PASSWORD INTERNAL_API_KEY MOCK_GATEWAY_SECRET; do
+  sed -i "s|^${var}=.*|${var}=$(openssl rand -hex 32)|" .env   # macOS: sed -i ''
+done
 
-# Build dan jalankan semua service
-docker compose up --build
+# 3. Build and start
+docker compose up --build -d
 
-# Cek semua service running
-docker compose ps
-
-## Keputusan Teknis & Trade-off
-
-### Pessimistic Locking untuk Concurrent Balance Update
-
-Menggunakan `SELECT FOR UPDATE` pada tabel wallets.
-
-**Alasan:** Di sistem finansial, correctness lebih penting dari throughput. Pessimistic locking menjamin tidak ada dua transaksi yang bisa memodifikasi saldo wallet yang sama secara bersamaan.
-
-**Trade-off:** Throughput lebih rendah dibanding optimistic locking saat concurrent request tinggi. Untuk skala production dengan volume sangat tinggi, perlu pertimbangkan sharding wallet atau queue per-wallet.
-
----
-
-### Deadlock Prevention pada Atomic Transfer
-
-Dua wallet di-lock dalam urutan UUID yang konsisten (UUID lebih kecil di-lock duluan).
-
-**Alasan:** Tanpa urutan konsisten, `transfer(A→B)` dan `transfer(B→A)` yang terjadi bersamaan bisa saling menunggu lock → deadlock.
-
-**Trade-off:** Sedikit overhead untuk sorting UUID, tapi menghilangkan entire class of bug.
-
----
-
-### Redis SET NX untuk Idempotency
-
-Menggunakan atomic `SET key value NX EX ttl` bukan GET-then-SET.
-
-**Alasan:** GET-then-SET adalah race condition — dua request identik bisa lolos bersamaan jika keduanya GET sebelum salah satu SET. NX (set-if-not-exists) adalah operasi atomic di Redis.
-
-**Trade-off:** TTL harus dipilih hati-hati. Terlalu pendek: duplicate terlewat. Terlalu panjang: Redis memory boros.
-
----
-
-### Audit Service Fire-and-Forget
-
-Payment-service call audit-service menggunakan `@Async`, exception ditangkap dan di-log saja.
-
-**Alasan:** Audit log tidak boleh mempengaruhi latency atau keberhasilan transaksi utama. Kalau audit-service down, transaksi tetap harus jalan.
-
-**Trade-off:** Audit log bisa hilang kalau audit-service down. Solusi production: gunakan message queue (Kafka/RabbitMQ) sehingga event tidak hilang meski consumer down sementara.
-
----
-
-### HMAC-SHA256 untuk Webhook Validation
-
-Signature = `HMAC-SHA256(gatewayRef:status:amount, sharedSecret)`
-
-**Alasan:** Memastikan webhook yang datang benar-benar dari mock-gateway kita, bukan dari pihak luar yang mencoba inject transaksi palsu.
-
-**Trade-off:** Shared secret harus dijaga kerahasiaannya. Jika bocor, attacker bisa forge webhook. Solusi: rotate secret secara berkala.
-````
-## Struktur Database
-auth DB:      users, refresh_tokens
-wallet DB:    wallets, mutations
-payment DB:   transactions, topup_requests, transfer_requests
-audit DB:     audit_logs
+# 4. Verify end to end (expects: Result: 18 passed, 0 failed)
+./scripts/smoke-test.sh
 ```
+
+If port 5432 or 6379 is already in use on your machine, set `POSTGRES_HOST_PORT` / `REDIS_HOST_PORT` in `.env` before step 3.
+
+## Project layout
+
+```
+auth/  wallets/  payment/  auditlog/  paymentgateway/   # one Maven module per service
+db/migration/                                           # SQL run by Postgres on first start
+scripts/generate-jwt-keys.sh                            # RS256 key pair → keys/
+scripts/smoke-test.sh                                   # end-to-end check via the public API
+docs/                                                   # getting started, API examples
+docker-compose.yaml  .env.example
+```
+
+## Technical decisions & trade-offs
+
+| Decision | Why | Trade-off |
+|---|---|---|
+| Pessimistic locking (`SELECT … FOR UPDATE`) on wallets | Correctness over throughput for money | Hot wallets serialize; very high volume needs sharding or per-wallet queues |
+| Lock both wallets in ascending user-id order | `A→B` and `B→A` at the same time cannot deadlock | Negligible |
+| Money invariants as DB constraints | A code bug cannot double-credit or write impossible ledger rows | Violations surface as 500s; migrations need care |
+| Idempotency: DB `UNIQUE (user_id, key)` + short Redis lock | DB is the source of truth for replays; Redis only stops concurrent duplicates | Redis outage → fail-open on the lock, the DB still guarantees exactly-once |
+| Commit `PENDING` before calling gateway/wallet | Webhooks always find the transaction; no DB connection held during HTTP calls | Needs reconciliation for unknown outcomes (implemented) |
+| Transfer outcome unknown → stay `PENDING` + reconciler | Never mark `FAILED` something that may have moved money | Reconciler retries until wallet-service answers |
+| RS256 tokens (private key only in auth) | A compromised wallet/payment service cannot mint tokens | Key distribution and rotation needed |
+| Login lockout in Redis (per user + per IP) | Stops password guessing; unknown usernames lock too (no enumeration) | Attacker can lock a known username for 15 min; fails open if Redis is down |
+| Async audit with MDC propagation | Audit never slows or breaks payments; logs stay correlated | Events lost if audit-service is down (no queue/outbox) |
+| HMAC-SHA256 webhooks, constant-time compare | Rejects forged callbacks without a timing oracle | Shared secret rotation is manual |

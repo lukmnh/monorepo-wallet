@@ -1,6 +1,6 @@
 # Database — GPay Wallet
 
-Persistence layer: one PostgreSQL 16 instance split into **4 schemas** (one per service), plus **Redis** for payment-service locks and counters.
+Persistence layer: one PostgreSQL 16 instance split into **4 schemas** (one per service), plus **Redis** for payment-service locks/limits and auth-service login lockout.
 
 > Source of truth: [db/migration/](db/migration/) (including the hardening migration [V1__0710261200_hardening_constraints.sql](db/migration/V1__0710261200_hardening_constraints.sql)) and the JPA entities. For service context see [architecture.md](architecture.md).
 
@@ -193,7 +193,7 @@ WHERE token_hash = ? AND revoked = false AND expires_at > now();
 | 0 | already revoked | **Reuse detected** → revoke every token of the user (committed via `noRollbackFor`), 401 |
 | 0 | expired | 401 |
 
-Lifecycle: rows are not deleted yet. `RefreshTokenRepository.deleteExpiredAndRevoked` exists but no job calls it (needs `@EnableScheduling` + a scheduled job).
+Lifecycle: `RefreshTokenCleanupJob` deletes rows with `expires_at < now()` daily (`JWT_CLEANUP_CRON`, default 03:00), using `idx_refresh_tokens_expires_at`. Revoked-but-unexpired rows are kept on purpose: deleting them would turn a replayed stolen token into a plain "invalid token" instead of triggering reuse detection.
 
 ### 3.3 `wallet.wallets`
 
@@ -261,22 +261,30 @@ Constraints / indexes:
 - `uq_transactions_user_idem UNIQUE (user_id, idempotency_key)`: two users can use the same key; one user cannot reuse a key.
 - `idx_transactions_user_created (user_id, created_at DESC)`: user history.
 - `idx_transactions_created_at (created_at DESC)`.
-- `idx_transactions_pending_topup (created_at) WHERE status='PENDING' AND type='TOPUP'`: partial index for the expiry scheduler; stays small because terminal rows drop out.
+- `idx_transactions_pending_topup (created_at) WHERE status='PENDING' AND type='TOPUP'`: partial index for the expiry job.
+- `idx_transactions_pending_transfer (created_at) WHERE status='PENDING' AND type='TRANSFER'`: partial index for the transfer reconciler ([V1__0710261500](db/migration/V1__0710261500_pending_transfer_index.sql)).
+
+Both partial indexes stay small because rows drop out as soon as they leave `PENDING`.
 
 Status state machine:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING : topup / transfer created
-    PENDING --> SUCCESS : webhook SUCCESS + wallet credit<br/>or wallet transfer 200
-    PENDING --> FAILED : webhook FAILED (failure_reason set)
-    PENDING --> EXPIRED : scheduler, TOPUP older than PENDING_EXPIRE_MINUTES (failure_reason set)
+    [*] --> PENDING : committed before any external call
+    PENDING --> SUCCESS : webhook SUCCESS + credit / wallet transfer 200 / reconciler 200
+    PENDING --> FAILED : webhook FAILED, gateway 4xx, wallet 4xx (insufficient, wallet not found)
+    PENDING --> EXPIRED : expiry job, TOPUP older than PENDING_EXPIRE_MINUTES
+    EXPIRED --> SUCCESS : late SUCCESS webhook (gateway took the money)
     SUCCESS --> [*]
     FAILED --> [*]
     EXPIRED --> [*]
 ```
 
-Terminal states are final: webhooks for a non-`PENDING` transaction are ignored. A failed transfer is still rolled back entirely (no row), so `FAILED` currently only occurs for top-ups (see [architecture.md §9](architecture.md#9-known-gaps-from-code-trace)).
+Rules:
+- Every transition out of `PENDING` is a compare-and-set (`UPDATE … WHERE status = 'PENDING'`, `resolvePending`/`expirePendingTopups`), or happens under `SELECT … FOR UPDATE` (webhook). Concurrent actors can't overwrite each other.
+- `SUCCESS` and `FAILED` are final. `EXPIRED` can only become `SUCCESS`, and only via a signed webhook.
+- Failed transfers **are persisted** (`FAILED` + `failure_reason`). Replaying the same idempotency key returns that stored result.
+- A transfer stays `PENDING` only when wallet-service's answer was lost (timeout/5xx); the reconciler re-sends it.
 
 ### 3.6 `payment.topup_requests`
 
@@ -286,7 +294,7 @@ Migration: [V1__0606262001_init_table_topup_request.sql](db/migration/V1__060626
 |---|---|---|---|
 | `id` | UUID | N | PK |
 | `transaction_id` | UUID | N | UNIQUE, FK → `payment.transactions(id)` (1:1) |
-| `gateway_ref` | VARCHAR(100) | Y | `GW-XXXXXXXX` from gateway; webhook lookup key. `uq_topup_requests_gateway_ref` (NULLs allowed while the gateway hasn't answered) |
+| `gateway_ref` | VARCHAR(100) | Y | `GW-XXXXXXXX` from gateway; primary webhook lookup key, `uq_topup_requests_gateway_ref`. NULL until the gateway answers; set by whichever comes first (initiate response or webhook) via `… WHERE gateway_ref IS NULL`. If NULL, the webhook falls back to `transaction_id` |
 | `callback_status` | VARCHAR(50) | Y | Raw webhook status |
 | `webhook_received_at` | TIMESTAMP | Y | |
 | `expires_at` | TIMESTAMP | N | now + `PENDING_EXPIRE_MINUTES`. Not used by the scheduler (it uses `transactions.created_at`) |
@@ -335,21 +343,23 @@ No retention/partitioning; grows unbounded.
 
 ---
 
-## 4. Redis keyspace (payment-service)
+## 4. Redis keyspace
 
-Client: `StringRedisTemplate`, all values are strings.
+Client: `StringRedisTemplate`, all values are strings. Every read-modify-write runs as **one Lua script** (atomic, and no key is ever left without a TTL).
 
-| Key pattern | Value | TTL | Written by | Purpose |
+| Key pattern | Service | Value | TTL | Purpose |
 |---|---|---|---|---|
-| `idempotency:lock:{userId}:{idempotencyKey}` | `PROCESSING` → `DONE` | 30 s → 24 h | `IdempotencyServiceImpl.tryLock` (`SET NX EX`) / `saveResponse` | In-flight guard for duplicate requests |
-| `idempotency:{userId}:{idempotencyKey}` | JSON `TransactionResponse` | 24 h | `saveResponse` | Replayed to duplicate requests |
-| `rate:payment:{userId}:{epochMinute}` | counter | 60 s (set on first `INCR`) | `RateLimitServiceImpl.checkAndIncrementRateLimit` | Max `PAYMENT_RATE_LIMIT_PER_MINUTE` (5) topup+transfer calls per minute |
-| `daily:transfer:{userId}:{yyyy-MM-dd}` | decimal string (sum of successful transfers) | 25 h | `incrementDailyTransfer` (GET + SET) | `DAILY_TRANSFER_LIMIT` enforcement |
+| `idempotency:lock:{userId}:{idempotencyKey}` | payment | random owner token | 60 s | Blocks concurrent duplicates only. `SET NX EX`; released with compare-and-delete (only by its owner) when the request ends |
+| `rate:payment:{userId}:{epochMinute}` | payment | counter | 60 s | Max `PAYMENT_RATE_LIMIT_PER_MINUTE` (5) topup+transfer calls per minute |
+| `daily:transfer-cents:{userId}:{yyyy-MM-dd}` | payment | integer cents reserved today | 25 h | `DAILY_TRANSFER_LIMIT`. Reserved atomically before the transfer (`INCRBY`, roll back if over the cap); released (`DECRBY`, only if the key exists) when the transfer definitively fails |
+| `login:fail:user:{username}` | auth | failed-login counter | `LOGIN_LOCK_MINUTES` (15 min) from first failure | ≥ `LOGIN_MAX_ATTEMPTS_PER_USER` (5) → login locked; deleted on successful login |
+| `login:fail:ip:{ip}` | auth | failed-login counter | 15 min | ≥ `LOGIN_MAX_ATTEMPTS_PER_IP` (20) → login locked for that IP |
 
 Notes:
-- Idempotency keys are scoped by user, the same as the DB's `UNIQUE (user_id, idempotency_key)`.
-- Daily-limit check and increment are separate non-atomic operations; `INCRBYFLOAT` or a Lua script would make it atomic.
-- Redis data is persisted in the `redis_data` volume but treated as disposable; Postgres `uq_transactions_user_idem` is the durable backstop.
+- **Replays are answered from Postgres** (`uq_transactions_user_idem`), not Redis. A replay therefore always returns the transaction's *current* state, and losing Redis never causes a double charge.
+- Redis failure policy: idempotency lock, rate limit and login lockout **fail open** (logged at ERROR); the daily transfer cap **fails closed** (request errors), because it is a money control.
+- Day boundaries for the daily cap use the JVM clock (UTC in the containers).
+- The old key formats (`idempotency:{userId}:{key}` response cache, `daily:transfer:*` decimal strings) are no longer read; they expire on their own.
 
 ---
 
@@ -362,13 +372,16 @@ Notes:
 | Credit (top-up) | wallets | Lock wallet → duplicate check → update balance → insert mutation | `FOR UPDATE` on 1 wallet row |
 | Debit | wallets | Same as credit, plus balance check | `FOR UPDATE` on 1 wallet row |
 | Atomic transfer | wallets | One TX: duplicate check, both legs + 2 mutations | `FOR UPDATE` on 2 rows, ascending `user_id` order |
-| Lazy wallet create | wallets | `INSERT … ON CONFLICT DO NOTHING` then read | none |
-| Top-up initiate | payment | TX open across the gateway HTTP call | none |
-| Webhook | payment | TX open across the wallet credit HTTP call | none |
-| Transfer | payment | TX open across the wallet transfer HTTP call; any exception → full rollback | none |
-| Expire stale | payment | One TX per scheduler run (scheduler currently not enabled) | none |
+| Register | auth | One TX: insert user (flushed) → call wallet-service create → commit; any failure rolls the user back | unique indexes |
+| Create / lazy-create wallet | wallets | `INSERT … ON CONFLICT DO NOTHING` then read (idempotent) | none |
+| Top-up initiate | payment | TX1 commit PENDING rows → gateway call (no TX) → conditional `gateway_ref` update | none |
+| Webhook | payment | One TX: lookup → `SELECT transactions … FOR UPDATE` → wallet credit (idempotent) → status | row lock on the transaction |
+| Transfer | payment | TX1 commit PENDING rows → wallet call (no TX) → `resolvePending` compare-and-set | none (wallet locks its rows) |
+| Expire stale top-ups | payment | Single conditional bulk `UPDATE … WHERE status='PENDING'` | waits on rows a webhook has locked |
+| Reconcile transfers | payment | Per transaction: wallet call (no TX) → `resolvePending` | none |
+| Refresh-token cleanup | auth | Single `DELETE … WHERE expires_at < now()` | none |
 
-Holding a local transaction (and a Hikari connection) across a remote HTTP call ties DB pool usage to downstream latency: up to 10 s per call with the default read timeout, pool size 20.
+payment-service never holds a DB transaction (or Hikari connection) while waiting on another service, except in the webhook, where the row lock must cover the credit. `open-in-view` is disabled in every service.
 
 ---
 
@@ -376,7 +389,7 @@ Holding a local transaction (and a Hikari connection) across a remote HTTP call 
 
 - Files live in [db/migration/](db/migration/) and are mounted into the postgres container at `/docker-entrypoint-initdb.d`.
 - Postgres runs them **once**, in filename order, only when the `postgres_data` volume is empty. Changes to existing files or new files are **not** applied to an existing volume.
-- No migration tool (Flyway/Liquibase) is on the classpath. The names look like Flyway (`V1__<ddMMyyHHmm>_…`), but every file uses version `V1`, so Flyway would reject them as duplicates.
+- No migration tool (Flyway/Liquibase) is used, by decision. Files are named `V1__<ddMMyyHHmm>_<what>.sql`, so filename order is chronological. New files must be written to be re-runnable where possible (`IF NOT EXISTS`) and applied by hand on existing volumes.
 - Services run `spring.jpa.hibernate.ddl-auto: validate`; startup fails if entities and tables drift.
 
 Execution order:
@@ -395,17 +408,21 @@ V1__0606262002_init_table_transfer_request.sql
 V1__0706261300_init_schema_audit.sql
 V1__0706261301_init_table_audit_log.sql
 V1__0710261200_hardening_constraints.sql      # constraints, per-user idempotency, index cleanup, failure_reason
+V1__0710261500_pending_transfer_index.sql     # partial index for the transfer reconciler
 ```
 
-Applying the hardening migration:
+Applying new migrations:
 
 ```bash
 # Fresh environment (destroys data): runs every file automatically
 docker compose down -v && docker compose up --build
 
-# Existing volume: apply the new file once, by hand
-docker exec -i postgres psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 \
-  < db/migration/V1__0710261200_hardening_constraints.sql
+# Existing volume: apply each new file once, in order, by hand
+set -a; source .env; set +a
+for f in db/migration/V1__0710261200_hardening_constraints.sql \
+         db/migration/V1__0710261500_pending_transfer_index.sql; do
+  docker exec -i postgres psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 < "$f"
+done
 ```
 
 On an existing volume the migration first lowercases `auth.users.username/email`. It fails if case-variant duplicates already exist (e.g. `Alice` and `alice`), or if existing rows violate a new `CHECK`/`UNIQUE`. Resolve those rows first.
@@ -429,9 +446,12 @@ Deploy order: **migration first, then services.** The new `Transactions.failureR
 | `jsonb` audit payload mapping | ✅ `@JdbcTypeCode(SqlTypes.JSON)` |
 | Race-safe lazy wallet create | ✅ `INSERT … ON CONFLICT DO NOTHING` |
 | `TransferRequest` explicit `schema = "payment"` | ✅ |
-| Flyway with real versioning | ⏳ open: schema changes on existing volumes are still manual |
+| Persist FAILED transfers with reason | ✅ outcome recorded after commit-first; unknown outcomes reconciled |
+| Atomic daily transfer cap | ✅ Lua reserve/release in integer cents |
+| Refresh-token cleanup job | ✅ `RefreshTokenCleanupJob` (expired rows only) |
+| Partial index for pending-transfer reconciler | ✅ `V1__0710261500` |
+| Migration versioning tool | ⛔ not adopted by decision (Flyway excluded); manual apply on existing volumes |
 | Separate DB role per schema (`audit` INSERT-only) | ⏳ open |
 | `TIMESTAMPTZ` + `Instant` | ⏳ open: must change DB and entities in one release (`validate`) |
 | `mutations.reference_id` as `UUID` | ⏳ open |
-| Refresh-token cleanup job, audit retention/partitioning | ⏳ open: needs `@EnableScheduling` |
-| Persist FAILED transfers (currently rolled back) | ⏳ open: see architecture.md §9 |
+| Audit retention / partitioning | ⏳ open |

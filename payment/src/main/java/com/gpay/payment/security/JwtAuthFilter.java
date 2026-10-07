@@ -4,7 +4,6 @@ import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
 import io.jsonwebtoken.JwtParser;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -17,9 +16,8 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
-import javax.crypto.SecretKey;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.List;
 
 @Slf4j
@@ -27,10 +25,10 @@ import java.util.List;
 public class JwtAuthFilter extends OncePerRequestFilter {
     private final JwtParser jwtParser;
 
-    public JwtAuthFilter(@Value("${jwt.secret}") String secret, @Value("${jwt.issuer}") String issuer) {
-        SecretKey secretKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+    public JwtAuthFilter(@Value("${jwt.public-key-path}") String publicKeyPath, @Value("${jwt.issuer}") String issuer) {
+        // Public key only: this service can verify tokens but never mint them
         this.jwtParser = Jwts.parser()
-                .verifyWith(secretKey)
+                .verifyWith(PemKeys.readRsaPublicKey(Path.of(publicKeyPath)))
                 .requireIssuer(issuer)
                 .require("type", "ACCESS")   // refresh/other token types are rejected
                 .clockSkewSeconds(30)

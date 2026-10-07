@@ -14,12 +14,14 @@ public class PaymentDTO {
             @NotNull(message = "Amount is required")
             @DecimalMin(value = "10000", message = "Minimum top-up is 10,000")
             @DecimalMax(value = "50000000", message = "Maximum top-up is 50,000,000")
+            @Digits(integer = 17, fraction = 2, message = "Amount must have at most 2 decimal places")
             BigDecimal amount,
 
             @NotBlank(message = "Scenario is required")
             @Pattern(regexp = "SUCCESS|FAILED|TIMEOUT", message = "Scenario must be SUCCESS, FAILED, or TIMEOUT")
             String scenario,
 
+            @Size(max = 255, message = "Description must be at most 255 characters")
             String description
     ) {}
 
@@ -29,8 +31,10 @@ public class PaymentDTO {
 
             @NotNull(message = "Amount is required")
             @DecimalMin(value = "1000", message = "Minimum transfer is 1,000")
+            @Digits(integer = 17, fraction = 2, message = "Amount must have at most 2 decimal places")
             BigDecimal amount,
 
+            @Size(max = 200, message = "Description must be at most 200 characters")
             String description
     ) {}
 
@@ -40,13 +44,21 @@ public class PaymentDTO {
             TransactionStatus status,
             BigDecimal amount,
             String description,
+            String failureReason,
             LocalDateTime createdAt
-    ) {}
+    ) {
+        public static TransactionResponse from(Transactions txn) {
+            return new TransactionResponse(txn.getId(), txn.getType(), txn.getStatus(), txn.getAmount(),
+                    txn.getDescription(), txn.getFailureReason(), txn.getCreatedAt());
+        }
+    }
 
+    /** Gateway callback. All fields are covered by the HMAC signature. */
     public record WebhookPayload(
-            String gatewayRef,
-            String status,   // SUCCESS or FAILED
-            BigDecimal amount
+            @NotBlank String gatewayRef,
+            @NotNull UUID transactionId,
+            @NotBlank @Pattern(regexp = "SUCCESS|FAILED") String status,
+            @NotNull BigDecimal amount
     ) {}
 
     public record ApiResponse<T>(
@@ -59,6 +71,9 @@ public class PaymentDTO {
         }
         public static <T> ApiResponse<T> error(String message) {
             return new ApiResponse<>(false, message, null);
+        }
+        public static <T> ApiResponse<T> fail(String message, T data) {
+            return new ApiResponse<>(false, message, data);
         }
     }
 }

@@ -1,0 +1,9 @@
+# Dockerfiles use "COPY . ." in the build stage: keep secrets and build output out of the context
+.env
+.env.*
+keys/
+**/target/
+.git/
+.idea/
+.vscode/
+.claude/

@@ -1,34 +1,37 @@
 package com.gpay.auth.service.common;
 
-import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.security.Keys;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import javax.crypto.SecretKey;
-import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.security.interfaces.RSAPrivateCrtKey;
 import java.util.Date;
 import java.util.UUID;
 
+/**
+ * Issues RS256 access tokens. Only auth-service holds the private key; wallet/payment
+ * verify with the public key, so a compromised resource service cannot mint tokens.
+ */
 @Service
 @Slf4j
 public class JwtService {
-    private final SecretKey secretKey;
+    private final RSAPrivateCrtKey privateKey;
     private final String issuer;
     private final long accessExpiryMinutes;
     private final long refreshExpiryDays;
 
     public JwtService(
-            @Value("${jwt.secret}") String secret,
+            @Value("${jwt.private-key-path}") String privateKeyPath,
             @Value("${jwt.issuer}") String issuer,
             @Value("${jwt.access-expiry-minutes}") long accessExpiryMinutes,
             @Value("${jwt.refresh-expiry-days}") long refreshExpiryDays) {
-        this.secretKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+        this.privateKey = PemKeys.readRsaPrivateKey(Path.of(privateKeyPath));
         this.issuer = issuer;
         this.accessExpiryMinutes = accessExpiryMinutes;
         this.refreshExpiryDays = refreshExpiryDays;
+        log.info("JWT signing key loaded: RS256, {} bits", privateKey.getModulus().bitLength());
     }
 
     public String generateAccessToken(UUID userId, String username) {
@@ -40,17 +43,8 @@ public class JwtService {
                 .claim("type", "ACCESS")
                 .issuedAt(new Date())
                 .expiration(new Date(System.currentTimeMillis() + accessExpiryMinutes * 60 * 1000))
-                .signWith(secretKey)
+                .signWith(privateKey, Jwts.SIG.RS256)
                 .compact();
-    }
-
-    public Claims parseToken(String token) {
-        return Jwts.parser()
-                .verifyWith(secretKey)
-                .requireIssuer(issuer)
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
     }
 
     public long getAccessExpirySeconds() {

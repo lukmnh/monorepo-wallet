@@ -2,7 +2,7 @@
 
 Microservices wallet system: register/login, top-up via a (mock) payment gateway, P2P transfer, balance and mutation history, audit logging.
 
-> Source of truth: the code, including the auth/DB hardening patch. Where the code differs from the README's intent, this doc follows the code and flags the gap in [Known gaps](#9-known-gaps-from-code-trace).
+> Source of truth: the code. Setup and upgrade steps are in [docs/getting-started.md](docs/getting-started.md), API usage in [docs/api-examples.md](docs/api-examples.md); schema details in [database.md](database.md). Remaining gaps are listed in [§9](#9-known-gaps).
 
 ---
 
@@ -11,13 +11,14 @@ Microservices wallet system: register/login, top-up via a (mock) payment gateway
 | Layer | Choice |
 |---|---|
 | Language / runtime | Java 21 (Eclipse Temurin) |
-| Framework | Spring Boot 3.5.14 (Web MVC, Data JPA, Security, Validation) |
-| Build | Maven multi-module (`wallet-parent` → 5 modules) |
-| Auth tokens | JJWT 0.12.5, HMAC-SHA (shared `JWT_SECRET`) |
+| Framework | Spring Boot 3.5.14 (Web MVC, Data JPA, Security, Validation, Data Redis) |
+| Build | Maven multi-module (`wallet-parent` → 5 independent modules, no cross-module dependencies) |
+| Auth tokens | JJWT 0.12.5, **RS256** (private key in auth-service only) |
 | Database | PostgreSQL 16 — one instance, one schema per service |
-| Cache / locks | Redis 7 (payment-service only) |
-| Inter-service calls | Synchronous REST via `RestTemplate` |
-| Packaging | Multi-stage Dockerfile per service, `docker-compose.yaml` |
+| Cache / locks | Redis 7 (payment-service: idempotency, limits; auth-service: login lockout) |
+| Inter-service calls | Synchronous REST via `RestTemplate` with explicit timeouts |
+| Async / jobs | Spring `@Async` (MDC-propagating executor), `@Scheduled` |
+| Packaging | Multi-stage Dockerfile per service, `docker-compose.yaml` with file-based secrets |
 
 ---
 
@@ -25,28 +26,31 @@ Microservices wallet system: register/login, top-up via a (mock) payment gateway
 
 ```
 monorepo-wallet/
-├── pom.xml              # parent POM: Boot parent, Java 21, jjwt versions
-├── auth/                # auth-service       :8081
-├── wallets/             # wallet-service     :8082
-├── payment/             # payment-service    :8083
-├── auditlog/            # audit-service      :8084
-├── paymentgateway/      # mock-gateway       :8085
-├── db/migration/        # raw SQL, mounted into postgres initdb
+├── pom.xml                       # parent POM: Boot parent, Java 21, jjwt versions
+├── auth/                         # auth-service       :8081
+├── wallets/                      # wallet-service     :8082
+├── payment/                      # payment-service    :8083
+├── auditlog/                     # audit-service      :8084
+├── paymentgateway/               # mock-gateway       :8085
+├── db/migration/                 # raw SQL, mounted into postgres initdb
+├── scripts/generate-jwt-keys.sh  # RS256 key pair → keys/ (git- and docker-ignored)
 └── docker-compose.yaml
 ```
 
-Every service follows the same layered package layout under `com.gpay.<module>`:
+Each service uses the same layered layout under `com.gpay.<module>`:
 
 ```
 controller → service (interface) → service/Impl → repository (Spring Data JPA) → entity
+client/     # outbound REST clients (wallet, audit, gateway)
 dto/        # Java records grouped in one *DTO class, incl. ApiResponse<T>
-exception/  # nested RuntimeException types + @RestControllerAdvice
+exception/  # nested RuntimeException types + @RestControllerAdvice (incl. Spring MVC 4xx errors)
 filter/     # TraceFilter (+ InternalApiKeyFilter where internal)
-security/   # JwtAuthFilter (wallets, payment)
-config/     # SecurityConfig, RestConfig, RedisConfig
+security/   # JwtAuthFilter + PemKeys (wallets, payment)
+scheduler/  # background jobs (payment, auth)
+config/     # SecurityConfig, RestConfig, AsyncConfig
 ```
 
-All JSON responses use the envelope `{ "success": bool, "message": string, "data": T }`. Each service declares its own copy of `ApiResponse` (no shared library module).
+All JSON responses use the envelope `{ "success": bool, "message": string, "data": T }`. Each service has its own `ApiResponse` copy; there is no shared library module.
 
 ---
 
@@ -71,32 +75,32 @@ flowchart LR
     RD[(Redis)]
 
     Client -->|register / login / refresh / logout| AUTH
-    Client -->|JWT: balance, mutations| WAL
-    Client -->|JWT: topup, transfer, get txn| PAY
+    Client -->|RS256 JWT: balance, mutations| WAL
+    Client -->|RS256 JWT: topup, transfer, get txn| PAY
 
+    AUTH -->|X-Internal-Api-Key<br/>create wallet on register| WAL
     PAY -->|X-Internal-Api-Key<br/>credit / transfer| WAL
-    PAY -->|X-Internal-Api-Key<br/>audit log| AUD
+    PAY -.->|async, X-Internal-Api-Key<br/>audit event| AUD
     PAY -->|POST /gateway/topup| GW
-    GW -->|webhook + HMAC signature| PAY
+    GW -.->|async webhook + HMAC,<br/>retried| PAY
 
     AUTH --> PG
+    AUTH -->|login lockout| RD
     WAL --> PG
     PAY --> PG
+    PAY -->|idempotency, limits| RD
     AUD --> PG
-    PAY --> RD
 ```
 
 ### Service responsibilities
 
 | Service | Owns | Public API | Internal API | Calls out to |
 |---|---|---|---|---|
-| **auth** | `auth.users`, `auth.refresh_tokens` | `POST /api/v1/auth/{register,login,refresh,logout}` | — | — |
-| **wallets** | `wallet.wallets`, `wallet.mutations` | `GET /v1/api/wallet/balance`, `GET /v1/api/wallet/api/v1/wallet/mutations` ⚠️ | `POST /api/v1/internal/wallet/{create,credit,debit,transfer}` | — |
-| **payment** | `payment.transactions`, `payment.topup_requests`, `payment.transfer_requests`, Redis keys | `POST /api/v1/topup`, `POST /api/v1/transfer`, `GET /api/v1/transactions/{id}` | `POST /api/v1/webhook/topup` (HMAC) | wallets, auditlog, gateway |
+| **auth** | `auth.users`, `auth.refresh_tokens`, Redis `login:fail:*` | `POST /api/v1/auth/{register,login,refresh,logout}` | — | wallets (create wallet) |
+| **wallets** | `wallet.wallets`, `wallet.mutations` | `GET /api/v1/wallet/balance`, `GET /api/v1/wallet/mutations?page&size` | `POST /api/v1/internal/wallet/{create,credit,debit,transfer}` (all idempotent) | — |
+| **payment** | `payment.transactions`, `payment.topup_requests`, `payment.transfer_requests`, Redis `idempotency:*`, `rate:*`, `daily:*` | `POST /api/v1/topup`, `POST /api/v1/transfer`, `GET /api/v1/transactions/{id}` | `POST /api/v1/webhook/topup` (HMAC) | wallets, auditlog, gateway |
 | **auditlog** | `audit.audit_logs` | — | `POST /api/v1/internal/audit` | — |
 | **paymentgateway** | stateless | — | `POST /gateway/topup` | payment (webhook) |
-
-⚠️ Wallet paths are inconsistent (`/v1/api/...` prefix and a doubled mutations path) — see [Known gaps](#9-known-gaps-from-code-trace).
 
 ---
 
@@ -104,14 +108,16 @@ flowchart LR
 
 | Concern | Mechanism | Where |
 |---|---|---|
-| User authentication | Access JWT (`iss`=`JWT_ISSUER`, `jti`, `sub`=userId, `username`, `type=ACCESS`), TTL `JWT_ACCESS_EXPIRY_MINUTES` | Issued by [JwtService.java](auth/src/main/java/com/gpay/auth/service/common/JwtService.java) |
-| Token validation | Each resource service verifies locally with the shared `JWT_SECRET` (no call to auth) and **requires** `iss` and `type=ACCESS` (30 s clock skew). Missing/invalid token → 401 via `HttpStatusEntryPoint` | [wallets JwtAuthFilter](wallets/src/main/java/com/gpay/wallets/security/JwtAuthFilter.java), [payment JwtAuthFilter](payment/src/main/java/com/gpay/payment/security/JwtAuthFilter.java) |
-| Refresh tokens | Opaque 256-bit random value (not a JWT), stored as SHA-256 hash. Rotated with an atomic conditional `UPDATE`; reusing a rotated token revokes every session of the user; inactive users can't refresh | [AuthServiceImpl.java](auth/src/main/java/com/gpay/auth/service/Impl/AuthServiceImpl.java) |
-| Login | Username/email normalized to lowercase. BCrypt always runs (dummy hash for unknown users) so timing doesn't reveal accounts; `is_active` checked only after a correct password; >72-byte passwords rejected before BCrypt | `AuthServiceImpl.login` |
-| Passwords | BCrypt (8–72 chars, ≤72 UTF-8 bytes) | auth `SecurityConfig`, `AuthDTO` |
-| Service-to-service | Static shared header `X-Internal-Api-Key` (`INTERNAL_API_KEY`) | `InternalApiKeyFilter` in wallets (only `/api/v1/internal/**`) and auditlog (all paths) |
-| Gateway → webhook | `X-Webhook-Signature = hex(HMAC-SHA256("gatewayRef:status:amount", MOCK_GATEWAY_SECRET))` | [GatewayServiceImpl.java](paymentgateway/src/main/java/com/gpay/paymentgateway/service/Impl/GatewayServiceImpl.java) signs, [WebhookServiceImpl.java](payment/src/main/java/com/gpay/payment/service/Impl/WebhookServiceImpl.java) verifies |
-| Ownership | `userId` always taken from the JWT `sub`, never from the request body; `GET /transactions/{id}` returns 404 if not owner | payment controllers |
+| Access tokens | RS256 JWT (`iss`, `jti`, `sub`=userId, `username`, `type=ACCESS`), TTL `JWT_ACCESS_EXPIRY_MINUTES`. Signed with the private key, which only auth-service has | [JwtService.java](auth/src/main/java/com/gpay/auth/service/common/JwtService.java) |
+| Token validation | wallets and payment verify with the **public key** and require `iss` + `type=ACCESS` (30 s clock skew). They cannot mint tokens; HS256/`none` tokens are rejected. Missing/invalid token → 401 | [wallets JwtAuthFilter](wallets/src/main/java/com/gpay/wallets/security/JwtAuthFilter.java), [payment JwtAuthFilter](payment/src/main/java/com/gpay/payment/security/JwtAuthFilter.java) |
+| Key distribution | PEM files from `scripts/generate-jwt-keys.sh`, mounted as compose secrets at `/run/secrets/jwt_{private,public}_key`; loaded and validated at startup (fail fast) | `PemKeys` in each service |
+| Refresh tokens | Opaque 256-bit random value, stored as SHA-256 hash. Rotated with an atomic conditional `UPDATE`; reuse of a rotated token revokes all sessions of the user; inactive users can't refresh; expired rows purged nightly | [AuthServiceImpl.java](auth/src/main/java/com/gpay/auth/service/Impl/AuthServiceImpl.java), [RefreshTokenCleanupJob.java](auth/src/main/java/com/gpay/auth/scheduler/RefreshTokenCleanupJob.java) |
+| Brute force | Redis counters per username (5) and per client IP (20) in a 15-min window. When the limit is hit, login is rejected with 429 + `Retry-After` even with the correct password. Unknown usernames are counted too (no enumeration). Fails open if Redis is down | [LoginAttemptService.java](auth/src/main/java/com/gpay/auth/service/common/LoginAttemptService.java) |
+| Login | Username/email lowercase-normalized; BCrypt always runs (dummy hash for unknown users); `is_active` revealed only after a correct password; >72-byte passwords rejected before BCrypt | `AuthServiceImpl.login` |
+| Service-to-service | Shared `X-Internal-Api-Key`, compared in **constant time**; a blank key fails startup | `InternalApiKeyFilter` (wallets, auditlog) |
+| Gateway → webhook | `X-Webhook-Signature = hex(HMAC-SHA256("gatewayRef:transactionId:status:amount", MOCK_GATEWAY_SECRET))`, verified in constant time; amount must equal the stored amount | [WebhookDispatcher.java](paymentgateway/src/main/java/com/gpay/paymentgateway/service/WebhookDispatcher.java), [WebhookServiceImpl.java](payment/src/main/java/com/gpay/payment/service/Impl/WebhookServiceImpl.java) |
+| Ownership | `userId` always comes from the JWT `sub`. `GET /transactions/{id}` returns 404 for other users' transactions | payment controllers |
+| Secrets hygiene | `.env` and `keys/` are git-ignored and excluded from Docker build contexts (`.dockerignore`) | repo root |
 
 All services are stateless (`SessionCreationPolicy.STATELESS`, CSRF disabled).
 
@@ -125,35 +131,48 @@ All services are stateless (`SessionCreationPolicy.STATELESS`, CSRF disabled).
 sequenceDiagram
     participant C as Client
     participant A as auth-service
+    participant R as Redis
+    participant W as wallet-service
     participant DB as auth schema
 
-    C->>A: POST /register {username,email,password}
-    A->>A: lowercase username/email, reject >72-byte password
-    A->>DB: exists? → INSERT users (bcrypt); unique race → 409
-    A-->>C: 201 {userId,username,email}
+    C->>A: POST /register
+    A->>DB: BEGIN, INSERT user (flush: duplicate → 409)
+    A->>W: POST /internal/wallet/create (idempotent)
+    alt wallet-service OK
+        A->>DB: COMMIT
+        A-->>C: 201
+    else unreachable / error
+        A->>DB: ROLLBACK (no user without wallet)
+        A-->>C: 503, retry is safe
+    end
 
     C->>A: POST /login
-    A->>DB: SELECT user by lowercase username
-    A->>A: bcrypt match (dummy hash if user missing), then check is_active
-    A->>DB: INSERT refresh_tokens (sha256(opaque token), expires_at=+JWT_REFRESH_EXPIRY_DAYS)
-    A-->>C: {accessToken, refreshToken, userId, accessExpiresIn, "Bearer"}
+    A->>R: locked? (login:fail:user / :ip)
+    alt locked
+        A-->>C: 429 + Retry-After
+    else
+        A->>DB: SELECT user, BCrypt (dummy if missing)
+        alt wrong credentials
+            A->>R: INCR counters (TTL 15 min)
+            A-->>C: 401
+        else ok
+            A->>R: DEL user counter
+            A->>DB: INSERT refresh token hash
+            A-->>C: RS256 access token + opaque refresh token
+        end
+    end
 
-    C->>A: POST /refresh {refreshToken}
-    A->>DB: UPDATE … SET revoked=true WHERE hash=? AND NOT revoked AND not expired
-    alt rowcount = 1 and user active
-        A->>DB: INSERT new refresh token
-        A-->>C: new token pair
+    C->>A: POST /refresh
+    A->>DB: UPDATE … SET revoked WHERE hash=? AND NOT revoked AND not expired
+    alt 1 row and user active
+        A-->>C: new pair
     else token already revoked (reuse)
-        A->>DB: revoke ALL tokens of user
-        A-->>C: 401
-    else expired / unknown / inactive user
+        A->>DB: revoke ALL user tokens
         A-->>C: 401
     end
 ```
 
-Note: registration does **not** create a wallet. A wallet row is created lazily the first time the user calls `GET balance` / `GET mutations` (`WalletServiceImpl.findWalletByUserId`, `INSERT … ON CONFLICT DO NOTHING`).
-
-### 5.2 Top-up (async via gateway webhook)
+### 5.2 Top-up (async gateway webhook)
 
 ```mermaid
 sequenceDiagram
@@ -162,40 +181,40 @@ sequenceDiagram
     participant R as Redis
     participant G as mock-gateway
     participant W as wallet-service
-    participant AU as audit-service
 
-    C->>P: POST /api/v1/topup + JWT + X-Idempotency-Key<br/>{amount, scenario, description}
-    P->>R: INCR rate:payment:{user}:{minute}  (≤5/min)
-    P->>R: idempotency check / SET NX lock (30s)
-    P->>P: BEGIN TX — INSERT transactions(PENDING, TOPUP), INSERT topup_requests
+    C->>P: POST /topup + X-Idempotency-Key
+    P->>R: rate limit (Lua INCR+EXPIRE), SET NX lock (60 s)
+    P->>P: key already in DB? → return its current state
+    P->>P: TX1: INSERT transactions(PENDING) + topup_requests → COMMIT
     P->>G: POST /gateway/topup {transactionId, amount, scenario}
-    G-->>P: {gatewayRef: "GW-XXXXXXXX", status: ACCEPTED}
-    P->>P: UPDATE topup_requests.gateway_ref, COMMIT
-    P->>AU: POST /internal/audit (TOPUP_INITIATED)
-    P->>R: SET idempotency:{key} = response (24h)
-    P-->>C: 202 {transactionId, status: PENDING}
+    G-->>P: {gatewayRef}  (webhook not sent yet)
+    P->>P: UPDATE gateway_ref WHERE gateway_ref IS NULL
+    P-->>C: 202 PENDING
+    P->>R: release lock
 
-    G->>P: POST /api/v1/webhook/topup + X-Webhook-Signature<br/>{gatewayRef, status, amount}
-    P->>P: verify HMAC, find topup by gateway_ref
-    alt txn not PENDING
-        P-->>G: 200 (no-op)
-    else status = SUCCESS
-        P->>W: POST /internal/wallet/credit {userId, amount, referenceId=txnId}
-        W->>W: SELECT ... FOR UPDATE wallet, balance += amount, INSERT mutation(CREDIT)
-        P->>P: txn → SUCCESS
-    else status = FAILED
-        P->>P: txn → FAILED
+    Note over G: @Async: sleep 1–1.5 s, then deliver (3 attempts, backoff 2 s / 4 s)
+    G->>P: POST /webhook/topup + HMAC {gatewayRef, transactionId, status, amount}
+    P->>P: verify HMAC (constant time)
+    P->>P: find by gateway_ref, else by transactionId
+    P->>P: SELECT transactions … FOR UPDATE, check amount
+    alt SUCCESS (txn PENDING or EXPIRED)
+        P->>W: credit (idempotent by referenceId)
+        P->>P: → SUCCESS
+    else FAILED and txn PENDING
+        P->>P: → FAILED + failure_reason
+    else txn already SUCCESS/FAILED
+        P->>P: no-op (duplicate delivery)
     end
-    P->>AU: audit TOPUP_WEBHOOK
 ```
 
-Gateway scenarios (chosen by the client, for testing): `SUCCESS` (webhook after 1.5s), `FAILED` (after 1s), `TIMEOUT` (no webhook — txn stays `PENDING` until expired by `PendingTransactionScheduler`).
+Why this ordering works:
+- The PENDING rows are committed **before** the gateway is called, so a webhook always finds the transaction.
+- The gateway responds before it sends the webhook, because dispatch goes through a separate `@Async` bean.
+- If the webhook still wins the race, payment-service falls back to looking up by `transactionId`.
 
-Validation: amount 10,000 – 50,000,000.
+Gateway scenarios: `SUCCESS`, `FAILED`, `TIMEOUT` (no webhook → expiry job → `EXPIRED`). A late `SUCCESS` webhook for an `EXPIRED` top-up still credits, because the gateway has taken the money.
 
-> ⚠️ As written, the gateway sends the webhook **synchronously, before** responding to payment-service, so the webhook arrives before `gateway_ref` is saved/committed. See [Known gaps](#9-known-gaps-from-code-trace) #1.
-
-### 5.3 Transfer (synchronous)
+### 5.3 Transfer (with persisted failures and reconciliation)
 
 ```mermaid
 sequenceDiagram
@@ -204,25 +223,25 @@ sequenceDiagram
     participant R as Redis
     participant W as wallet-service
 
-    C->>P: POST /api/v1/transfer + JWT + X-Idempotency-Key<br/>{toUserId, amount, description}
-    P->>R: rate limit + idempotency lock
-    P->>P: reject self-transfer
-    P->>R: GET daily:transfer:{user}:{date} — check DAILY_TRANSFER_LIMIT
-    P->>P: BEGIN TX — INSERT transactions(PENDING, TRANSFER), INSERT transfer_requests
-    P->>W: POST /internal/wallet/transfer {from, to, amount, referenceId=txnId}
-    W->>W: lock both wallets FOR UPDATE in UUID order (deadlock-free)<br/>check balance, debit + credit, 2 mutations
+    C->>P: POST /transfer + X-Idempotency-Key
+    P->>R: rate limit, SET NX lock
+    P->>P: key already in DB? → return its current state (422 if FAILED)
+    P->>R: Lua: reserve amount against daily cap (atomic)
+    P->>P: TX1: INSERT transactions(PENDING) + transfer_requests → COMMIT
+    P->>W: POST /internal/wallet/transfer (referenceId = txnId; 1 retry on timeout/5xx)
     alt 200
-        P->>P: txn → SUCCESS, COMMIT
-        P->>R: daily:transfer += amount (TTL 25h)
-        P-->>C: 200 {status: SUCCESS}
-    else 422 insufficient balance
-        P-->>C: 422 (local TX rolled back)
-    else other error
-        P-->>C: 500 TransferFailed (local TX rolled back)
+        P->>P: PENDING → SUCCESS
+        P-->>C: 200
+    else 422 / 404 / other 4xx
+        P->>P: PENDING → FAILED + reason, release daily reservation
+        P-->>C: 422 with transaction
+    else timeout / 5xx (outcome unknown)
+        P-->>C: 202 PENDING
+        Note over P: reconciler re-sends after 120 s; wallet dedupes by referenceId
     end
 ```
 
-Validation: amount ≥ 1,000. Daily limit default 10,000,000.
+Status transitions use `UPDATE … WHERE status = 'PENDING'`, so the request thread, reconciler, webhook and expiry job can never overwrite each other's terminal status.
 
 ---
 
@@ -230,69 +249,70 @@ Validation: amount ≥ 1,000. Daily limit default 10,000,000.
 
 ### Consistency & concurrency
 
-| Problem | Solution in code | Location |
+| Problem | Solution | Location |
 |---|---|---|
-| Concurrent balance updates | Pessimistic lock `SELECT … FOR UPDATE` (`@Lock(PESSIMISTIC_WRITE)`) + `@Version` column on wallets | [WalletRepository.java](wallets/src/main/java/com/gpay/wallets/repository/WalletRepository.java) |
-| Deadlock on A→B / B→A transfers | Lock wallets in ascending `userId` order | `WalletServiceImpl.atomicTransfer` |
-| Debit + credit atomicity | Single wallet-service DB transaction for both legs | `/internal/wallet/transfer` |
-| Duplicate client requests | Redis idempotency per user (`X-Idempotency-Key`, SET NX lock + cached response) + DB `UNIQUE(user_id, idempotency_key)` | [IdempotencyServiceImpl.java](payment/src/main/java/com/gpay/payment/service/Impl/IdempotencyServiceImpl.java) |
-| Duplicate webhook / credit / transfer | Skip if txn not `PENDING`; wallet credit/debit/transfer check `(wallet, reference_id, type)` under the row lock; DB `UNIQUE (wallet_id, reference_id, type)` as backstop | `WebhookServiceImpl`, `WalletServiceImpl` |
-| Ledger corruption | DB `CHECK`s: `amount > 0`, `balance_after = balance_before ± amount`, enum values | [V1__0710261200_hardening_constraints.sql](db/migration/V1__0710261200_hardening_constraints.sql) |
-| Abuse | 5 payment requests/min/user (fixed window, shared by topup + transfer); daily transfer cap | [RateLimitServiceImpl.java](payment/src/main/java/com/gpay/payment/service/Impl/RateLimitServiceImpl.java) |
-| Stale top-ups | `@Scheduled(fixedDelay=5m)` marks `PENDING` TOPUP older than `PENDING_EXPIRE_MINUTES` as `EXPIRED` | [PendingTransactionScheduler.java](payment/src/main/java/com/gpay/payment/scheduler/PendingTransactionScheduler.java) |
+| Concurrent balance updates | `SELECT … FOR UPDATE` + `@Version` on wallets | [WalletRepository.java](wallets/src/main/java/com/gpay/wallets/repository/WalletRepository.java) |
+| Transfer deadlocks | Lock wallets in ascending `userId` order | `WalletServiceImpl.atomicTransfer` |
+| Duplicate client requests | DB `UNIQUE (user_id, idempotency_key)` is the source of truth for replays; a Redis SET NX lock (owner-token release) blocks concurrent duplicates; a lost insert race replays the winner | [IdempotencyServiceImpl.java](payment/src/main/java/com/gpay/payment/service/Impl/IdempotencyServiceImpl.java), `IdempotentReplay` |
+| Same key, different request | 422 `Idempotency key was already used for a different request` | `IdempotentReplay` |
+| Duplicate webhook / credit / transfer | Webhook row lock + terminal-state check; wallet-service checks `(wallet, reference_id, type)` under the row lock; DB `UNIQUE (wallet_id, reference_id, type)` | `WebhookServiceImpl`, `WalletServiceImpl` |
+| Unknown transfer outcome | Stays `PENDING`; reconciler re-sends (idempotent) | `PendingTransactionScheduler.reconcilePendingTransfers` |
+| Expiry vs webhook race | Expiry is a conditional bulk `UPDATE`; the webhook holds the row lock | `TransactionRepository.expirePendingTopups` |
+| Daily cap under concurrency | Lua `INCRBY` + check + rollback in one script, integer cents | [RateLimitServiceImpl.java](payment/src/main/java/com/gpay/payment/service/Impl/RateLimitServiceImpl.java) |
+| Ledger corruption | DB `CHECK`s: amount > 0, `balance_after = balance_before ± amount`, enum values | [V1__0710261200_hardening_constraints.sql](db/migration/V1__0710261200_hardening_constraints.sql) |
+| User without wallet | Wallet created inside the registration TX; failure rolls back the user | `AuthServiceImpl.register` |
 
-There is no distributed transaction / saga. payment-service holds its local DB transaction open while calling wallet-service; if the remote call succeeds but the local commit fails, money moves without a payment record (rare, not reconciled).
+### Background jobs
 
-### Idempotency request handling (payment controllers)
+| Service | Job | Trigger | Effect |
+|---|---|---|---|
+| payment | `expireStaleTopups` | every `PAYMENT_SCHEDULER_INTERVAL_MS` (60 s) | `PENDING` TOPUP older than `PENDING_EXPIRE_MINUTES` → `EXPIRED` + reason |
+| payment | `reconcilePendingTransfers` | every 60 s | Re-sends `PENDING` TRANSFER older than `TRANSFER_RECONCILE_AFTER_SECONDS`, using the original `traceId` in logs |
+| auth | `RefreshTokenCleanupJob` | `JWT_CLEANUP_CRON` (03:00) | Deletes expired refresh tokens (revoked-but-unexpired kept for reuse detection) |
 
-```
-exists(lock or response)?
- ├─ response cached → 200 + cached body
- └─ lock only       → 409 "still being processed"
-tryLock (SET NX idempotency:lock:{userId}:{key} PROCESSING EX 30)
- └─ fail → 409
-execute → saveResponse (24h) → lock value = DONE (24h)
-```
-
-If the service throws, the lock is not released; retries get 409 for up to 30 s, then are processed again.
+Jobs run on a single instance. Running several payment-service replicas is still safe because every transition is conditional, but the work would be duplicated.
 
 ### Observability
 
-- `TraceFilter` (every service): reads `X-Trace-Id` or generates a UUID, puts it in SLF4J MDC, echoes it in the response header.
-- payment-service propagates `X-Trace-Id` on outbound calls to wallets, auditlog and gateway; `trace_id` is also persisted on `payment.transactions` and `audit.audit_logs`.
-- Log pattern: `[traceId=…] [userId=…]` (userId set by `JwtAuthFilter` / login).
-- Audit: payment-service posts `TOPUP_INITIATED`, `TOPUP_WEBHOOK`, `TRANSFER` events to audit-service. Failures are caught and logged, never fail the business call.
-- No actuator dependency, metrics, or distributed tracing backend.
+- `TraceFilter` (every service) reads or creates `X-Trace-Id`, puts it into the MDC and echoes it back in the response.
+- payment-service propagates `X-Trace-Id` to wallets, auditlog and gateway, and auth propagates it to wallets. The trace id is persisted on `payment.transactions` and `audit.audit_logs`.
+- `@Async` work (audit) inherits the MDC through a `TaskDecorator`, so audit rows keep `trace_id`. Scheduled reconciliation restores the transaction's original `traceId`.
+- Audit events: `TOPUP_INITIATED`, `TOPUP_WEBHOOK`, `TRANSFER`, `TRANSFER_RECONCILED`. Delivery is asynchronous and best-effort.
 
 ### Error mapping
 
-| Exception | HTTP |
+| Case | HTTP |
 |---|---|
-| Validation (`@Valid`) | 400 |
+| Validation, malformed JSON, missing header/param, bad idempotency key, self-transfer, bad webhook | 400 |
 | Invalid credentials / token, bad webhook signature | 401 |
-| Inactive account, missing internal API key | 403 |
-| Not found (wallet, transaction) | 404 |
-| Username/email/wallet exists, idempotency in-flight | 409 |
-| Insufficient balance, daily limit | 422 |
-| Rate limit | 429 + `Retry-After: 60` |
+| Inactive account, wrong internal API key | 403 |
+| Unknown path / transaction | 404 |
+| Duplicate username/email, idempotency key in flight | 409 |
+| Transaction `FAILED`/`EXPIRED` (body includes the transaction), daily limit, key reused with a different request | 422 |
+| Payment rate limit, login lockout | 429 + `Retry-After` |
+| Wallet provisioning unavailable on register | 503 |
 | Unhandled | 500 `"Internal server error"` |
+
+Payment success codes: `200` SUCCESS, `202` PENDING.
 
 ---
 
-## 7. Deployment (docker-compose)
+## 7. Deployment
 
 ```mermaid
 flowchart TB
     subgraph gpay-network [bridge network: gpay-network]
         postgres[(postgres:16-alpine :5432)]
-        redis[(redis:7-alpine :6379, requirepass)]
-        auth[auth-service :8081]
-        wallet[wallet-service :8082]
-        payment[payment-service :8083]
+        redis[(redis:7-alpine :6379)]
+        auth[auth-service :8081<br/>secret: jwt_private_key]
+        wallet[wallet-service :8082<br/>secret: jwt_public_key]
+        payment[payment-service :8083<br/>secret: jwt_public_key]
         audit[audit-service :8084]
         gw[mock-gateway :8085]
     end
     auth -- healthy --> postgres
+    auth -- healthy --> redis
+    auth -- started --> wallet
     wallet -- healthy --> postgres
     audit -- healthy --> postgres
     payment -- healthy --> postgres
@@ -301,37 +321,44 @@ flowchart TB
     gw -- started --> payment
 ```
 
-- Each image: `maven:3.9.9-eclipse-temurin-21-alpine` build stage running `mvn package -pl <module> -am`, then `eclipse-temurin:21-jre-alpine` runtime as non-root `appuser`.
-- Build context is the repo root (needed for the parent POM).
-- Every container port is published to the host, including internal ones (8084, 8085, wallet `/internal`).
-- DB schema is created by mounting `db/migration/` into `/docker-entrypoint-initdb.d` (runs only on an empty volume). Services use `ddl-auto: validate`.
+- Images: a `maven:3.9.9-eclipse-temurin-21-alpine` build stage (`mvn package -pl <module> -am`), then `eclipse-temurin:21-jre-alpine` running as non-root `appuser`.
+- Build context is the repo root; `.dockerignore` keeps `.env`, `keys/`, `target/`, `.git/` out of it.
+- JWT keys are compose file secrets. Key files must be world-readable (`644`) because compose bind-mounts them for the non-root user; use a real secret store in production.
+- DB schema is created from `db/migration/` on an empty volume only. Existing volumes need the manual steps in [getting-started §5](docs/getting-started.md#5-upgrading-an-existing-environment).
 
 ### Configuration (env vars)
 
 | Variable | Used by | Default |
 |---|---|---|
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | compose → all DB services | — |
-| `REDIS_PASSWORD` | redis, payment | — |
-| `JWT_SECRET` | auth, wallets, payment | — (must be ≥ 256-bit for HS256) |
-| `JWT_ISSUER` | auth (sets `iss`), wallets, payment (require it) | `gpay-auth` — must match across services |
+| `POSTGRES_HOST_PORT`, `REDIS_HOST_PORT` | compose (host side of the port mapping only) | 5432, 6379 |
+| `REDIS_PASSWORD` | redis, auth, payment | — |
+| `JWT_PRIVATE_KEY_PATH` | auth | `keys/jwt_private.pem` (compose: `/run/secrets/jwt_private_key`) |
+| `JWT_PUBLIC_KEY_PATH` | wallets, payment | `keys/jwt_public.pem` (compose: `/run/secrets/jwt_public_key`) |
+| `JWT_ISSUER` | auth (sets), wallets + payment (require) | `gpay-auth` |
 | `JWT_ACCESS_EXPIRY_MINUTES`, `JWT_REFRESH_EXPIRY_DAYS` | auth | — |
-| `INTERNAL_API_KEY` | wallets, payment, auditlog | auditlog has a hardcoded fallback |
-| `MOCK_GATEWAY_SECRET` | payment, gateway | — |
+| `JWT_CLEANUP_CRON` | auth | `0 0 3 * * *` |
+| `LOGIN_MAX_ATTEMPTS_PER_USER`, `LOGIN_MAX_ATTEMPTS_PER_IP`, `LOGIN_LOCK_MINUTES` | auth | 5, 20, 15 |
+| `INTERNAL_API_KEY` | auth, wallets, payment, auditlog | — (blank fails startup) |
+| `MOCK_GATEWAY_SECRET` | payment, gateway | — (blank fails startup) |
 | `DAILY_TRANSFER_LIMIT` | payment | 10000000 |
 | `PAYMENT_RATE_LIMIT_PER_MINUTE` | payment | 5 |
 | `TOPUP_TIMEOUT_SECONDS` | payment (gateway read timeout) | 5 |
 | `PENDING_EXPIRE_MINUTES` | payment | 60 |
-| `WALLET_SERVICE_URL`, `AUDIT_SERVICE_URL`, `PAYMENT_GATEWAY_URL` | payment | `http://localhost:808x` |
+| `PAYMENT_SCHEDULER_INTERVAL_MS` | payment | 60000 |
+| `TRANSFER_RECONCILE_AFTER_SECONDS` | payment | 120 |
+| `WALLET_SERVICE_URL` | auth, payment | `http://localhost:8082` |
+| `AUDIT_SERVICE_URL`, `PAYMENT_GATEWAY_URL` | payment | `http://localhost:808x` |
 | `PAYMENT_SERVICE_WEBHOOK_URL` | gateway | `http://payment-service:8083/api/v1/webhook/topup` |
 
-`.env.example` currently lists only a subset of these (it still uses `POSTGRES_DB_*` names that compose doesn't read).
+### HTTP client timeouts
 
-### HTTP client timeouts (payment-service)
-
-| Client | Connect | Read |
-|---|---|---|
-| Default `RestTemplate` (wallets, auditlog) | 3 s | 10 s |
-| `gatewayRestTemplate` | 3 s | `TOPUP_TIMEOUT_SECONDS` (5 s) |
+| Client | Connect | Read | Retries |
+|---|---|---|---|
+| auth → wallets (create wallet) | 2 s | 5 s | none (client retries register) |
+| payment → wallets, auditlog | 3 s | 10 s | transfer: 1 retry on timeout/5xx |
+| payment → gateway | 3 s | `TOPUP_TIMEOUT_SECONDS` | none (stays PENDING) |
+| gateway → payment webhook | 3 s | 10 s | 3 attempts, 2 s / 4 s backoff |
 
 ---
 
@@ -339,50 +366,28 @@ flowchart TB
 
 | Decision | Why | Trade-off |
 |---|---|---|
-| Schema-per-service in one Postgres | Data ownership boundaries, simple local ops | Shared instance/user = no real isolation; single point of failure |
-| Local JWT verification with shared secret | No auth round-trip per request | Secret on every service; no immediate access-token revocation |
-| Pessimistic locking on wallets | Correctness over throughput for money | Hot wallets serialize; scale needs sharding/queueing |
-| Redis SET NX idempotency (per user) + DB unique | Atomic, avoids GET-then-SET race; DB is the durable backstop | TTL tuning; lock not released on failure (30 s 409 window) |
-| Money invariants as DB constraints | Code bugs can't write a corrupt ledger or double-credit | Violations surface as 500s; needs migration discipline |
-| Sync REST between services | Simple | Temporal coupling; no retry/circuit breaker |
-| Best-effort audit | Audit must not break payments | Lost events if audit is down (no queue/outbox) |
-| HMAC-signed webhooks | Reject forged callbacks | Shared secret rotation is manual |
+| Schema-per-service in one Postgres | Data ownership boundaries, simple local ops | Shared instance/user = no hard isolation; single point of failure |
+| RS256, private key only in auth | Resource services can't mint tokens; no secret shared with them | Key rotation = redeploy + re-login; no JWKS endpoint yet |
+| Pessimistic locking on wallets | Correctness over throughput for money | Hot wallets serialize |
+| No DB transaction across HTTP calls | Webhooks see committed state; DB pool not tied to downstream latency | Requires explicit compare-and-set transitions and a reconciler |
+| Unknown outcome → PENDING + idempotent retry | Never record FAILED for money that may have moved | Transfers can complete minutes later |
+| Money invariants as DB constraints | Code bugs can't corrupt the ledger | Migrations need care |
+| Synchronous wallet provisioning in register | Every user has a wallet; no orphan users | Registration depends on wallet-service availability (503) |
+| Redis login lockout per user + IP | Stops password guessing without DB writes | Known usernames can be locked by an attacker for 15 min |
+| Best-effort async audit | Audit must not slow or break payments | Events lost if audit is down (no queue/outbox) |
 
 ---
 
-## 9. Known gaps (from code trace)
+## 9. Known gaps
 
-Originally found by static reading. Items marked ✅ were fixed in the hardening patch and verified with a runtime smoke test (Postgres + Redis + auth/wallets/payment/auditlog).
-
-### Open
-
-| # | Issue | Effect | Location |
-|---|---|---|---|
-| 1 | Gateway webhook is sent synchronously before `/gateway/topup` returns (`sendWebhookAsync` is a self-call, and `@EnableAsync` is absent). payment-service hasn't stored `gateway_ref` or committed yet | Webhook fails with "Unknown gatewayRef" (400); top-ups never credit, stay `PENDING` | `GatewayServiceImpl.initiateTopup`, `TopupServiceImpl.topup` |
-| 2 | No `@EnableScheduling` in any module | `PendingTransactionScheduler` never runs; nothing expires; no refresh-token cleanup | `PaymentApplication`, `AuthApplication` |
-| 3 | No `@EnableAsync` | `AuditClient.log` runs synchronously and adds audit latency to every payment request (contradicts README "fire-and-forget") | `PaymentApplication`, `AuditClient` |
-| 5 | Wallet never created on register; credit/transfer require an existing wallet | Top-up credit / incoming transfer for a user who never called `GET balance` → 404 from wallet-service | `AuthServiceImpl.register`, `WalletClient.createWallet` (unused) |
-| 6 | Transfer catch blocks set `FAILED` then rethrow inside `@Transactional` | Whole TX rolls back; failed transfers leave no `transactions` row; idempotency lock held 30 s | `TransferServiceImpl.transfer` |
-| 8 | Wallet controller paths: `/v1/api/wallet/balance` and `/v1/api/wallet/api/v1/wallet/mutations` | Inconsistent with `/api/v1/...` used everywhere else | `WalletController.java` |
-| 9 | Daily limit is read-check then later write (non-atomic); rate limit is a fixed window | Concurrent transfers can exceed the daily cap | `RateLimitServiceImpl` |
-| 11 | Webhook signature compared with `String.equals` and expected value logged | Timing side-channel; secret-derived value in logs | `WebhookServiceImpl.validateSignature` |
-| 12 | `wallets`, `payment`, `auditlog` POMs depend on the `auth` module (apparently for transitive jjwt) | Unneeded coupling to another service's code | module `pom.xml`s |
-| 15 | Shared symmetric `JWT_SECRET` on every service | Any service can mint tokens; should move to EdDSA/RS256 + JWKS | all JWT users |
-| 16 | No login brute-force protection | Unlimited password guessing | auth-service |
-
-### Fixed
-
-| # | Issue | Fix |
+| Issue | Effect | Suggested fix |
 |---|---|---|
-| 4 ✅ | `jsonb` audit columns mapped as plain `String` → inserts rejected | `@JdbcTypeCode(SqlTypes.JSON)`; unserializable payload stored as `NULL` |
-| 7 ✅ | Resource services accepted any valid JWT incl. `type=REFRESH` | Parser requires `iss` + `type=ACCESS`; refresh tokens are now opaque, not JWTs |
-| 10 ✅ | Refresh expiry hardcoded to 7 days | Uses `JWT_REFRESH_EXPIRY_DAYS` |
-| 13 ✅ | Double-escaped username regex | `^(?!\d+$)[a-zA-Z0-9]+$` |
-| 14 ✅ | Transfer without `description` → `Map.of` NPE in `WalletClient` → every such transfer failed | Pass the defaulted `txn.getDescription()` |
-| A2–A5 ✅ | Refresh: no active-user check, read-check-write race, no reuse detection; login leaked existence/status via timing/order | Atomic `consumeIfActive`, family revocation on reuse, dummy-hash BCrypt, status check after password |
-| A8–A10 ✅ | Register race → 500; >72-byte password → 500; case-sensitive identity | 409 handler, byte-length guard, lowercase normalization + `lower()` unique indexes |
-| A12 ✅ | Invalid/missing token → 403; JWT filter registered twice | `HttpStatusEntryPoint(401)`; servlet registration disabled |
-| E2/E3 ✅ | Lazy wallet create race aborted TX; `version = 0L` forced `merge()` | `INSERT … ON CONFLICT DO NOTHING`; `version` null on new entities |
-| D1–D9 ✅ | Missing DB money invariants, global idempotency key, index mismatch | See [database.md §7](database.md#7-hardening-status) |
-
-See [database.md](database.md) for schema details.
+| Single shared DB user for all schemas | Any service can read/write any schema | One role per schema; audit gets `INSERT` only |
+| `TIMESTAMP` without time zone | Ambiguous if a container's TZ changes | `TIMESTAMPTZ` + `Instant`, migrated together with entities |
+| No migration versioning (Flyway deliberately not used) | New SQL files must be applied by hand on existing volumes | Keep the manual steps in getting-started §5, or adopt a migration runner later |
+| Gateway has no status-query API | A top-up whose webhooks all fail is expired even if the gateway charged; only a later webhook can fix it | Reconcile against a gateway status endpoint |
+| Audit delivery is best-effort | Events lost if audit-service is down | Transactional outbox or message broker |
+| Login lockout can be triggered by others | 15-min denial for a targeted username | CAPTCHA / progressive delays instead of a hard lock |
+| Behind a reverse proxy, the client IP is the proxy's | Per-IP lockout becomes global | Enable `server.forward-headers-strategy` with a trusted proxy |
+| Rate limit is a fixed 1-minute window | Bursts at window edges | Sliding window / token bucket |
+| No automated tests beyond `contextLoads` | Regressions caught late | Testcontainers integration tests for the flows above |
