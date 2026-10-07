@@ -64,6 +64,7 @@ public class WebhookServiceImpl implements WebhookService {
             log.info("Topup SUCCESS txnId={} userId={} amount={}", txn.getId(), txn.getUserId(), txn.getAmount());
         } else {
             txn.setStatus(TransactionStatus.FAILED);
+            txn.setFailureReason("Gateway reported status " + payload.status());
             log.info("Topup FAILED txnId={} userId={}", txn.getId(), txn.getUserId());
         }
 

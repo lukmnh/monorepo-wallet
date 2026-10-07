@@ -3,6 +3,8 @@ package com.gpay.auditlog.entity;
 import jakarta.persistence.*;
 import lombok.*;
 import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 
 import java.time.LocalDateTime;
 import java.util.UUID;
@@ -37,9 +39,12 @@ public class AuditLog {
     @Column(length = 50)
     private String status;
 
+    // JSON type hint: bind as jsonb, not varchar (Postgres rejects varchar -> jsonb without a cast)
+    @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "request_payload", columnDefinition = "jsonb")
     private String requestPayload;
 
+    @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "response_payload", columnDefinition = "jsonb")
     private String responsePayload;
 

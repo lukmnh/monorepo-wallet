@@ -43,8 +43,8 @@ public class TopupController {
         }
 
         // Idempotency check
-        if (idempotencyService.exists(idempotencyKey)) {
-            var cached = idempotencyService.getResponse(idempotencyKey);
+        if (idempotencyService.exists(userId, idempotencyKey)) {
+            var cached = idempotencyService.getResponse(userId, idempotencyKey);
             if (cached.isPresent()) {
                 log.info("Duplicate topup request idempotencyKey={}, returning cached response", idempotencyKey);
                 TransactionResponse cachedResp = objectMapper.readValue(cached.get(), TransactionResponse.class);
@@ -56,13 +56,13 @@ public class TopupController {
         }
 
         // try to acquire idempotency lock
-        if (!idempotencyService.tryLock(idempotencyKey)) {
+        if (!idempotencyService.tryLock(userId, idempotencyKey)) {
             return ResponseEntity.status(HttpStatus.CONFLICT)
                     .body(ApiResponse.error("Duplicate request detected"));
         }
 
         TransactionResponse response = topupService.topup(userId, request, idempotencyKey);
-        idempotencyService.saveResponse(idempotencyKey, response);
+        idempotencyService.saveResponse(userId, idempotencyKey, response);
 
         return ResponseEntity.status(HttpStatus.ACCEPTED)
                 .body(ApiResponse.ok("Top-up initiated. Waiting for payment gateway callback.", response));

@@ -33,6 +33,7 @@ public class PendingTransactionScheduler {
         log.info("Expiring {} stale PENDING topup transactions", stale.size());
         stale.forEach(txn -> {
             txn.setStatus(TransactionStatus.EXPIRED);
+            txn.setFailureReason("No gateway callback within " + pendingExpireMinutes + " minutes");
             log.info("Expired txnId={} userId={} amount={} createdAt={}",
                     txn.getId(), txn.getUserId(), txn.getAmount(), txn.getCreatedAt());
         });

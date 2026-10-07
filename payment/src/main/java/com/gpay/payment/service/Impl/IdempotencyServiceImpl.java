@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.util.Optional;
+import java.util.UUID;
 
 @Service
 @Slf4j
@@ -24,33 +25,38 @@ public class IdempotencyServiceImpl implements IdempotencyService {
     private final ObjectMapper objectMapper;
 
     @Override
-    public boolean tryLock(String idempotencyKey) {
-        String lockKey = LOCK_PREFIX + idempotencyKey;
+    public boolean tryLock(UUID userId, String idempotencyKey) {
         Boolean acquired = redisTemplate.opsForValue()
-                .setIfAbsent(lockKey, "PROCESSING", LOCK_TTL);
+                .setIfAbsent(LOCK_PREFIX + scope(userId, idempotencyKey), "PROCESSING", LOCK_TTL);
         return Boolean.TRUE.equals(acquired);
     }
 
     @Override
-    public <T> void saveResponse(String idempotencyKey, T response) {
+    public <T> void saveResponse(UUID userId, String idempotencyKey, T response) {
+        String key = scope(userId, idempotencyKey);
         try {
             String json = objectMapper.writeValueAsString(response);
-            redisTemplate.opsForValue().set(PREFIX + idempotencyKey, json, RESPONSE_TTL);
-            redisTemplate.opsForValue().set(LOCK_PREFIX + idempotencyKey, "DONE", RESPONSE_TTL);
+            redisTemplate.opsForValue().set(PREFIX + key, json, RESPONSE_TTL);
+            redisTemplate.opsForValue().set(LOCK_PREFIX + key, "DONE", RESPONSE_TTL);
         } catch (JsonProcessingException e) {
-            log.error("Failed to serialize idempotency response for key={}", idempotencyKey, e);
+            log.error("Failed to serialize idempotency response for key={}", key, e);
         }
     }
 
     @Override
-    public Optional<String> getResponse(String idempotencyKey) {
-        String value = redisTemplate.opsForValue().get(PREFIX + idempotencyKey);
-        return Optional.ofNullable(value);
+    public Optional<String> getResponse(UUID userId, String idempotencyKey) {
+        return Optional.ofNullable(redisTemplate.opsForValue().get(PREFIX + scope(userId, idempotencyKey)));
     }
 
     @Override
-    public boolean exists(String idempotencyKey) {
-        return Boolean.TRUE.equals(redisTemplate.hasKey(LOCK_PREFIX + idempotencyKey))
-                || Boolean.TRUE.equals(redisTemplate.hasKey(PREFIX + idempotencyKey));
+    public boolean exists(UUID userId, String idempotencyKey) {
+        String key = scope(userId, idempotencyKey);
+        return Boolean.TRUE.equals(redisTemplate.hasKey(LOCK_PREFIX + key))
+                || Boolean.TRUE.equals(redisTemplate.hasKey(PREFIX + key));
+    }
+
+    // Mirrors DB constraint UNIQUE (user_id, idempotency_key)
+    private static String scope(UUID userId, String idempotencyKey) {
+        return userId + ":" + idempotencyKey;
     }
 }

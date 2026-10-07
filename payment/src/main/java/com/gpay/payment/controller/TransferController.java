@@ -43,8 +43,8 @@ public class TransferController {
         }
 
         // Idempotency check
-        if (idempotencyService.exists(idempotencyKey)) {
-            var cached = idempotencyService.getResponse(idempotencyKey);
+        if (idempotencyService.exists(userId, idempotencyKey)) {
+            var cached = idempotencyService.getResponse(userId, idempotencyKey);
             if (cached.isPresent()) {
                 log.info("Duplicate transfer request idempotencyKey={}", idempotencyKey);
                 TransactionResponse cachedResp = objectMapper.readValue(cached.get(), TransactionResponse.class);
@@ -54,13 +54,13 @@ public class TransferController {
                     .body(ApiResponse.error("Request is still being processed."));
         }
 
-        if (!idempotencyService.tryLock(idempotencyKey)) {
+        if (!idempotencyService.tryLock(userId, idempotencyKey)) {
             return ResponseEntity.status(HttpStatus.CONFLICT)
                     .body(ApiResponse.error("Duplicate request detected"));
         }
 
         TransactionResponse response = transferService.transfer(userId, request, idempotencyKey);
-        idempotencyService.saveResponse(idempotencyKey, response);
+        idempotencyService.saveResponse(userId, idempotencyKey, response);
 
         return ResponseEntity.ok(ApiResponse.ok("Transfer successful", response));
     }

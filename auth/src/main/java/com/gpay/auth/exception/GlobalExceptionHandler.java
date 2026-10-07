@@ -2,6 +2,7 @@ package com.gpay.auth.exception;
 
 import com.gpay.auth.dto.AuthDTO.ApiResponse;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
@@ -45,6 +46,19 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(AuthException.InvalidTokenException.class)
     public ResponseEntity<ApiResponse<Void>> handleInvalidToken(AuthException.InvalidTokenException ex) {
         return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(ApiResponse.error(ex.getMessage()));
+    }
+
+    @ExceptionHandler(AuthException.InvalidPasswordException.class)
+    public ResponseEntity<ApiResponse<Void>> handleInvalidPassword(AuthException.InvalidPasswordException ex) {
+        return ResponseEntity.badRequest().body(ApiResponse.error(ex.getMessage()));
+    }
+
+    // Concurrent register with the same username/email: the unique index rejects the loser at commit
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<ApiResponse<Void>> handleConflict(DataIntegrityViolationException ex) {
+        log.warn("Data integrity violation: {}", ex.getMostSpecificCause().getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiResponse.error("Username or email already registered"));
     }
 
     @ExceptionHandler(Exception.class)

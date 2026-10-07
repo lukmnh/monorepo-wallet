@@ -23,6 +23,7 @@ spring:
 
 jwt:
   secret: ${JWT_SECRET}
+  issuer: ${JWT_ISSUER:gpay-auth}
   access-expiry-minutes: ${JWT_ACCESS_EXPIRY_MINUTES}
   refresh-expiry-days: ${JWT_REFRESH_EXPIRY_DAYS}
 

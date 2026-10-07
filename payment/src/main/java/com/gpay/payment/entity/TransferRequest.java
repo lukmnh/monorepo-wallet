@@ -8,7 +8,7 @@ import java.time.LocalDateTime;
 import java.util.UUID;
 
 @Entity
-@Table(name = "transfer_requests")
+@Table(name = "transfer_requests", schema = "payment")
 @Getter
 @Setter
 @NoArgsConstructor

@@ -8,7 +8,6 @@ import com.gpay.auth.repository.RefreshTokenRepository;
 import com.gpay.auth.repository.UserRepository;
 import com.gpay.auth.service.AuthService;
 import com.gpay.auth.service.common.JwtService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -18,32 +17,61 @@ import org.springframework.transaction.annotation.Transactional;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.time.LocalDateTime;
+import java.util.Base64;
 import java.util.HexFormat;
+import java.util.Locale;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class AuthServiceImpl implements AuthService {
+
+    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final int REFRESH_TOKEN_BYTES = 32;
+    // BCrypt rejects input above 72 bytes (UTF-8) in both encode() and matches()
+    private static final int BCRYPT_MAX_BYTES = 72;
 
     private final UserRepository userRepository;
     private final RefreshTokenRepository refreshTokenRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwtService;
+    // Compared against when the username does not exist, so both paths cost one BCrypt check
+    private final String dummyPasswordHash;
+
+    public AuthServiceImpl(UserRepository userRepository,
+                           RefreshTokenRepository refreshTokenRepository,
+                           PasswordEncoder passwordEncoder,
+                           JwtService jwtService) {
+        this.userRepository = userRepository;
+        this.refreshTokenRepository = refreshTokenRepository;
+        this.passwordEncoder = passwordEncoder;
+        this.jwtService = jwtService;
+        this.dummyPasswordHash = passwordEncoder.encode("timing-equalizer");
+    }
 
     @Override
     @Transactional
     public RegisterResponse register(RegisterRequest request) {
-        if (userRepository.existsByUsername(request.username())) {
+        // @Size counts chars; multi-byte input can still exceed BCrypt's byte limit
+        if (exceedsBcryptLimit(request.password())) {
+            throw new AuthException.InvalidPasswordException("Password must be at most 72 bytes");
+        }
+
+        String username = normalize(request.username());
+        String email = normalize(request.email());
+
+        // Fast-path checks; a concurrent duplicate still hits the DB unique index -> 409 via GlobalExceptionHandler
+        if (userRepository.existsByUsername(username)) {
             throw new AuthException.UsernameAlreadyExistsException("Username already taken");
         }
-        if (userRepository.existsByEmail(request.email())) {
+        if (userRepository.existsByEmail(email)) {
             throw new AuthException.EmailAlreadyExistsException("Email already registered");
         }
 
         Users user = Users.builder()
-                .username(request.username())
-                .email(request.email())
+                .username(username)
+                .email(email)
                 .password(passwordEncoder.encode(request.password()))
                 .build();
 
@@ -60,15 +88,23 @@ public class AuthServiceImpl implements AuthService {
     @Override
     @Transactional
     public TokenResponse login(LoginRequest request) {
-        Users user = userRepository.findByUsername(request.username())
-                .orElseThrow(() -> new AuthException.InvalidCredentialsException("Invalid username or password"));
-
-        if (!user.isActive()) {
-            throw new AuthException.AccountInactiveException("Account is disabled");
+        // Such a password can never match a stored hash; reject before BCrypt throws
+        if (exceedsBcryptLimit(request.password())) {
+            throw new AuthException.InvalidCredentialsException("Invalid username or password");
         }
 
-        if (!passwordEncoder.matches(request.password(), user.getPassword())) {
+        Users user = userRepository.findByUsername(normalize(request.username())).orElse(null);
+
+        // Always run BCrypt: response time must not reveal whether the username exists
+        boolean passwordValid = passwordEncoder.matches(
+                request.password(), user != null ? user.getPassword() : dummyPasswordHash);
+        if (user == null || !passwordValid) {
             throw new AuthException.InvalidCredentialsException("Invalid username or password");
+        }
+
+        // Account status is only revealed to someone who already proved the password
+        if (!user.isActive()) {
+            throw new AuthException.AccountInactiveException("Account is disabled");
         }
 
         MDC.put("userId", user.getId().toString());
@@ -77,25 +113,31 @@ public class AuthServiceImpl implements AuthService {
     }
 
     @Override
-    @Transactional
+    @Transactional(noRollbackFor = AuthException.InvalidTokenException.class)
     public TokenResponse refreshToken(RefreshTokenRequest request) {
         String tokenHash = hashToken(request.refreshToken());
 
         RefreshToken refreshToken = refreshTokenRepository.findByTokenHash(tokenHash)
                 .orElseThrow(() -> new AuthException.InvalidTokenException("Invalid refresh token"));
 
-        if (refreshToken.isRevoked()) {
-            throw new AuthException.InvalidTokenException("Refresh token has been revoked");
+        // Atomic compare-and-set: of N concurrent refreshes with the same token, exactly one wins
+        if (refreshTokenRepository.consumeIfActive(tokenHash, LocalDateTime.now()) == 0) {
+            if (refreshToken.isRevoked()) {
+                // A rotated token was presented again => likely stolen; kill every session of this user.
+                // noRollbackFor keeps this revocation committed even though we throw.
+                refreshTokenRepository.revokeAllByUserId(refreshToken.getUser().getId());
+                log.warn("Refresh token reuse detected, all sessions revoked userId={}", refreshToken.getUser().getId());
+            }
+            throw new AuthException.InvalidTokenException("Invalid refresh token");
         }
 
-        if (refreshToken.getExpiresAt().isBefore(LocalDateTime.now())) {
-            throw new AuthException.InvalidTokenException("Refresh token has expired");
+        Users user = refreshToken.getUser();
+        if (!user.isActive()) {
+            refreshTokenRepository.revokeAllByUserId(user.getId());
+            throw new AuthException.InvalidTokenException("Invalid refresh token");
         }
 
-        refreshToken.setRevoked(true);
-        refreshTokenRepository.save(refreshToken);
-
-        return generateTokenPair(refreshToken.getUser());
+        return generateTokenPair(user);
     }
 
     @Override
@@ -110,12 +152,12 @@ public class AuthServiceImpl implements AuthService {
 
     private TokenResponse generateTokenPair(Users user) {
         String accessToken = jwtService.generateAccessToken(user.getId(), user.getUsername());
-        String refreshTokenStr = jwtService.generateRefreshToken(user.getId());
+        String refreshTokenStr = generateOpaqueToken();
 
         RefreshToken refreshTokenEntity = RefreshToken.builder()
                 .user(user)
                 .tokenHash(hashToken(refreshTokenStr))
-                .expiresAt(LocalDateTime.now().plusDays(7))
+                .expiresAt(LocalDateTime.now().plusDays(jwtService.getRefreshExpiryDays()))
                 .build();
         refreshTokenRepository.save(refreshTokenEntity);
 
@@ -126,6 +168,21 @@ public class AuthServiceImpl implements AuthService {
                 jwtService.getAccessExpirySeconds(),
                 "Bearer"
         );
+    }
+
+    // Refresh tokens are validated by DB lookup only, so a random 256-bit value is enough (no JWT needed)
+    private static String generateOpaqueToken() {
+        byte[] bytes = new byte[REFRESH_TOKEN_BYTES];
+        RANDOM.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    private static boolean exceedsBcryptLimit(String password) {
+        return password.getBytes(StandardCharsets.UTF_8).length > BCRYPT_MAX_BYTES;
+    }
+
+    private static String normalize(String value) {
+        return value.trim().toLowerCase(Locale.ROOT);
     }
 
     private String hashToken(String token) {

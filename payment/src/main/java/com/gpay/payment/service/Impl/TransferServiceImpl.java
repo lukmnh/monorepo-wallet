@@ -71,7 +71,7 @@ public class TransferServiceImpl implements TransferService {
                     request.toUserId(),
                     request.amount(),
                     txn.getId().toString(),
-                    request.description()
+                    txn.getDescription()   // never null (defaulted above); WalletClient uses Map.of, which rejects nulls
             );
             txn.setStatus(TransactionStatus.SUCCESS);
             transactionRepository.save(txn);

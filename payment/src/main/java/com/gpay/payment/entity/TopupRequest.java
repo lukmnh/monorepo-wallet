@@ -23,7 +23,7 @@ public class TopupRequest {
     @JoinColumn(name = "transaction_id", nullable = false, unique = true)
     private Transactions transaction;
 
-    @Column(name = "gateway_ref", length = 100)
+    @Column(name = "gateway_ref", length = 100, unique = true)
     private String gatewayRef;
 
     @Column(name = "callback_status", length = 50)

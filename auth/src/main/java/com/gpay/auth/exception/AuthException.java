@@ -20,4 +20,8 @@ public class AuthException {
     public static class InvalidTokenException extends RuntimeException {
         public InvalidTokenException(String message) { super(message); }
     }
+
+    public static class InvalidPasswordException extends RuntimeException {
+        public InvalidPasswordException(String message) { super(message); }
+    }
 }
