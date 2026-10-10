@@ -1,6 +1,6 @@
 # Database — GPay Wallet
 
-Persistence layer: one PostgreSQL 16 instance split into **4 schemas** (one per service), plus **Redis** for payment-service locks/limits and auth-service login lockout.
+Persistence layer: one PostgreSQL 16 instance split into **5 schemas** (one per service), plus **Redis** for payment-service locks/limits and auth-service login lockout.
 
 > Source of truth: [db/migration/](db/migration/) (including the hardening migration [V1__0710261200_hardening_constraints.sql](db/migration/V1__0710261200_hardening_constraints.sql)) and the JPA entities. For service context see [architecture.md](architecture.md).
 
@@ -12,8 +12,9 @@ Persistence layer: one PostgreSQL 16 instance split into **4 schemas** (one per 
 |---|---|---|---|
 | `auth` | auth-service | `users`, `refresh_tokens` | `auth` |
 | `wallet` | wallet-service | `wallets`, `mutations` | `wallet` |
-| `payment` | payment-service | `transactions`, `topup_requests`, `transfer_requests` | `payment` |
+| `payment` | payment-service | `transactions`, `topup_requests`, `transfer_requests`, `outbox_events` | `payment` |
 | `audit` | audit-service | `audit_logs` | `audit` |
+| `notification` | notification-service | `notifications` | `notification` |
 
 Rules:
 
@@ -131,10 +132,14 @@ erDiagram
 auth.users.id ─┬─< wallet.wallets.user_id              (1:1, unique)
                ├─< payment.transactions.user_id
                ├─< payment.transfer_requests.from_user_id / to_user_id
-               └─< audit.audit_logs.user_id
+               ├─< audit.audit_logs.user_id
+               └─< notification.notifications.user_id  (recipient)
 
 payment.transactions.id ─┬─< wallet.mutations.reference_id   (as VARCHAR; 1 CREDIT for topup, DEBIT + CREDIT for transfer)
-                         └─< audit.audit_logs.transaction_id
+                         ├─< audit.audit_logs.transaction_id
+                         └─< notification.notifications.transaction_id  (1 for topup, 2 for transfer)
+
+payment.outbox_events.id  ≈  notification.notifications.event_id   (correlation)
 
 payment.transactions.trace_id  ≈  audit.audit_logs.trace_id   (X-Trace-Id correlation)
 ```
@@ -341,6 +346,49 @@ Indexes: `idx_audit_logs_trace_id`, `idx_audit_logs_user_id`, `idx_audit_logs_tr
 
 No retention/partitioning; grows unbounded.
 
+### 3.9 `payment.outbox_events`
+
+Migration: [V1__1010261002_init_table_outbox_events.sql](db/migration/V1__1010261002_init_table_outbox_events.sql) · Entity: [OutboxEvent.java](payment/src/main/java/com/gpay/payment/entity/OutboxEvent.java)
+
+Transactional outbox. A row is inserted **in the same DB transaction** that moves a payment to `SUCCESS` (webhook TX for top-ups, `resolvePending` TX for transfers), so the event exists if and only if the status change committed. `OutboxRelayScheduler` delivers it to notification-service.
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| `id` | UUID | N | PK, assigned in Java; sent downstream as `eventId` |
+| `aggregate_id` | UUID | N | `payment.transactions.id`. `UNIQUE (aggregate_id, event_type)`: inserted with `ON CONFLICT DO NOTHING` |
+| `event_type` | VARCHAR(50) | N | `TOPUP_SUCCEEDED`, `TRANSFER_SUCCEEDED` |
+| `payload` | JSONB | N | Full event as sent (`PaymentSucceededEvent`) |
+| `status` | VARCHAR(15) | N | `PENDING` → `PUBLISHED` \| `DEAD` (CHECK) |
+| `attempts` | INT | N | Failed deliveries so far |
+| `next_attempt_at` | TIMESTAMP | N | Due time; also the claim lease (now + 60 s) while a relay is sending |
+| `last_error` | VARCHAR(500) | Y | Last delivery error |
+| `trace_id` | VARCHAR(100) | Y | Restored into the MDC when relaying |
+| `created_at` / `published_at` | TIMESTAMP | N / Y | |
+
+Indexes: partial `idx_outbox_events_due (next_attempt_at) WHERE status = 'PENDING'`.
+
+`DEAD` rows (10 failed attempts, or rejected with 400) need a manual replay: `UPDATE payment.outbox_events SET status='PENDING', attempts=0, next_attempt_at=now() WHERE status='DEAD';`. Published rows are kept (no purge job yet).
+
+### 3.10 `notification.notifications`
+
+Migration: [V1__1010261001_init_table_notifications.sql](db/migration/V1__1010261001_init_table_notifications.sql) · Entity: [Notification.java](notification/src/main/java/com/gpay/notification/entity/Notification.java)
+
+In-app inbox, one row per recipient. Title/body are rendered at ingest and stored, so the inbox shows the same text as the push.
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| `id` | UUID | N | PK, assigned in Java |
+| `event_id` | UUID | N | `payment.outbox_events.id` (correlation) |
+| `user_id` | UUID | N | Recipient |
+| `type` | VARCHAR(30) | N | `TOPUP_SUCCESS`, `TRANSFER_SENT`, `TRANSFER_RECEIVED` (CHECK) |
+| `title` / `body` | VARCHAR(100) / VARCHAR(255) | N | e.g. `Top up berhasil` / `Saldo Rp50.000 sudah masuk ke GPay kamu.` |
+| `amount`, `currency` | NUMERIC(19,2), VARCHAR(3) | N | `CHECK (amount > 0)`; currency `IDR` |
+| `transaction_id` | UUID | N | Deep-link target. `UNIQUE (transaction_id, type)` = dedupe key for redelivered events |
+| `is_read`, `read_at` | BOOLEAN, TIMESTAMP | N, Y | |
+| `created_at` | TIMESTAMP | N | When the payment succeeded (`occurredAt`), not when the event arrived |
+
+Indexes: `idx_notifications_user_created (user_id, created_at DESC)` for the inbox; partial `idx_notifications_user_unread (user_id) WHERE is_read = FALSE` for the badge.
+
 ---
 
 ## 4. Redis keyspace
@@ -376,7 +424,9 @@ Notes:
 | Create / lazy-create wallet | wallets | `INSERT … ON CONFLICT DO NOTHING` then read (idempotent) | none |
 | Top-up initiate | payment | TX1 commit PENDING rows → gateway call (no TX) → conditional `gateway_ref` update | none |
 | Webhook | payment | One TX: lookup → `SELECT transactions … FOR UPDATE` → wallet credit (idempotent) → status | row lock on the transaction |
-| Transfer | payment | TX1 commit PENDING rows → wallet call (no TX) → `resolvePending` compare-and-set | none (wallet locks its rows) |
+| Transfer | payment | TX1 commit PENDING rows → wallet call (no TX) → TX2: `resolvePending` compare-and-set + outbox insert (only if it won) | none (wallet locks its rows) |
+| Outbox relay | payment | TX: `SELECT … FOR UPDATE SKIP LOCKED` due rows + lease → commit → HTTP per event (no TX) → mark published/failed | row locks only during the claim |
+| Notification ingest | notification | One TX: `INSERT … ON CONFLICT (transaction_id, type) DO NOTHING` per recipient; push after commit | unique index |
 | Expire stale top-ups | payment | Single conditional bulk `UPDATE … WHERE status='PENDING'` | waits on rows a webhook has locked |
 | Reconcile transfers | payment | Per transaction: wallet call (no TX) → `resolvePending` | none |
 | Refresh-token cleanup | auth | Single `DELETE … WHERE expires_at < now()` | none |
@@ -409,6 +459,9 @@ V1__0706261300_init_schema_audit.sql
 V1__0706261301_init_table_audit_log.sql
 V1__0710261200_hardening_constraints.sql      # constraints, per-user idempotency, index cleanup, failure_reason
 V1__0710261500_pending_transfer_index.sql     # partial index for the transfer reconciler
+V1__1010261000_init_schema_notification.sql
+V1__1010261001_init_table_notifications.sql   # notification inbox
+V1__1010261002_init_table_outbox_events.sql   # payment transactional outbox
 ```
 
 Applying new migrations:
@@ -420,7 +473,10 @@ docker compose down -v && docker compose up --build
 # Existing volume: apply each new file once, in order, by hand
 set -a; source .env; set +a
 for f in db/migration/V1__0710261200_hardening_constraints.sql \
-         db/migration/V1__0710261500_pending_transfer_index.sql; do
+         db/migration/V1__0710261500_pending_transfer_index.sql \
+         db/migration/V1__1010261000_init_schema_notification.sql \
+         db/migration/V1__1010261001_init_table_notifications.sql \
+         db/migration/V1__1010261002_init_table_outbox_events.sql; do
   docker exec -i postgres psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 < "$f"
 done
 ```

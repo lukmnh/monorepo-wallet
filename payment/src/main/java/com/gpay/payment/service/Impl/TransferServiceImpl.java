@@ -11,6 +11,7 @@ import com.gpay.payment.entity.TransferRequest;
 import com.gpay.payment.exception.PaymentException;
 import com.gpay.payment.repository.TransactionRepository;
 import com.gpay.payment.repository.TransferRequestRepository;
+import com.gpay.payment.service.NotificationOutboxService;
 import com.gpay.payment.service.RateLimitService;
 import com.gpay.payment.service.TransferService;
 import lombok.extern.slf4j.Slf4j;
@@ -44,6 +45,7 @@ public class TransferServiceImpl implements TransferService {
     private final WalletClient walletClient;
     private final AuditClient auditClient;
     private final RateLimitService rateLimitService;
+    private final NotificationOutboxService notificationOutbox;
     private final TransactionTemplate transactionTemplate;
 
     public TransferServiceImpl(TransactionRepository transactionRepository,
@@ -51,12 +53,14 @@ public class TransferServiceImpl implements TransferService {
                                WalletClient walletClient,
                                AuditClient auditClient,
                                RateLimitService rateLimitService,
+                               NotificationOutboxService notificationOutbox,
                                PlatformTransactionManager transactionManager) {
         this.transactionRepository = transactionRepository;
         this.transferRequestRepository = transferRequestRepository;
         this.walletClient = walletClient;
         this.auditClient = auditClient;
         this.rateLimitService = rateLimitService;
+        this.notificationOutbox = notificationOutbox;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
@@ -133,7 +137,7 @@ public class TransferServiceImpl implements TransferService {
     private Transactions settle(Transactions txn, UUID toUserId) {
         try {
             callWallet(txn, toUserId);
-            transactionRepository.resolvePending(txn.getId(), TransactionStatus.SUCCESS, null, LocalDateTime.now());
+            markSucceeded(txn, toUserId);
             log.info("Transfer SUCCESS txnId={} from={} to={} amount={}", txn.getId(), txn.getUserId(), toUserId, txn.getAmount());
         } catch (HttpClientErrorException.UnprocessableEntity e) {
             fail(txn, "Insufficient balance");
@@ -162,6 +166,18 @@ public class TransferServiceImpl implements TransferService {
                 log.warn("wallet-service call failed txnId={} attempt={}, retrying: {}", txn.getId(), attempt, e.getMessage());
             }
         }
+    }
+
+    /**
+     * SUCCESS + outbox event in one DB transaction. Only the actor that wins the PENDING -> SUCCESS
+     * compare-and-set records the event, so request thread and reconciler never notify twice.
+     */
+    private void markSucceeded(Transactions txn, UUID toUserId) {
+        transactionTemplate.executeWithoutResult(status -> {
+            if (transactionRepository.resolvePending(txn.getId(), TransactionStatus.SUCCESS, null, LocalDateTime.now()) == 1) {
+                notificationOutbox.transferSucceeded(txn, toUserId);
+            }
+        });
     }
 
     private void fail(Transactions txn, String reason) {

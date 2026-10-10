@@ -16,6 +16,7 @@ For an automated check of the same flow, run `./scripts/smoke-test.sh`.
 - [7. Mutation history](#7-mutation-history)
 - [8. Refresh token](#8-refresh-token)
 - [9. Logout](#9-logout)
+- [10. Notifications](#10-notifications)
 - [Error reference](#error-reference)
 - [Advanced: simulate a gateway webhook](#advanced-simulate-a-gateway-webhook)
 
@@ -25,10 +26,10 @@ For an automated check of the same flow, run `./scripts/smoke-test.sh`.
 
 | Item | Rule |
 |---|---|
-| Base URLs | auth `:8081`, wallet `:8082`, payment `:8083` |
+| Base URLs | auth `:8081`, wallet `:8082`, payment `:8083`, notification `:8086` |
 | Body format | JSON, `Content-Type: application/json` |
 | Response envelope | `{ "success": bool, "message": string, "data": object \| null }`. Errors use the same shape |
-| Authentication | `Authorization: Bearer <accessToken>` on wallet and payment endpoints. Tokens last 15 minutes |
+| Authentication | `Authorization: Bearer <accessToken>` on wallet, payment and notification endpoints. Tokens last 15 minutes |
 | Idempotency | `X-Idempotency-Key: <1–100 chars>` is **required** on `POST /topup` and `POST /transfer`. Use a new key per operation, and reuse it **only** to retry that same operation |
 | Money | Decimal with at most 2 fraction digits. Top-up 10,000 – 50,000,000; transfer ≥ 1,000 |
 | Tracing | Every response has an `X-Trace-Id` header; send your own to correlate across services |
@@ -41,6 +42,7 @@ For an automated check of the same flow, run `./scripts/smoke-test.sh`.
 AUTH=http://localhost:8081
 WALLET=http://localhost:8082
 PAYMENT=http://localhost:8083
+NOTIF=http://localhost:8086
 ```
 
 ---
@@ -376,6 +378,80 @@ curl -s -X POST $AUTH/api/v1/auth/logout -H 'Content-Type: application/json' \
 `200 OK`
 ```json
 { "success": true, "message": "Logged out successfully", "data": null }
+```
+
+---
+
+## 10. Notifications
+
+A successful top-up notifies the payer. A successful transfer notifies both the sender and the recipient. Each notification carries the amount. They show up about 2 s after the transaction reaches `SUCCESS` (they are delivered through payment-service's outbox). Failed or expired transactions don't create notifications.
+
+### List (inbox)
+
+`GET /api/v1/notifications?page=0&size=20`. Newest first; `size` is capped at 100.
+
+```bash
+curl -s "$NOTIF/api/v1/notifications?page=0&size=20" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+`200 OK`
+```json
+{
+  "success": true,
+  "message": "Notifications retrieved",
+  "data": {
+    "content": [
+      {
+        "id": "8a0f3c1e-2b7d-4c55-9a51-0f6e3b1d2c44",
+        "type": "TRANSFER_SENT",
+        "title": "Transfer berhasil",
+        "body": "Kamu berhasil mengirim Rp10.000.",
+        "amount": 10000.00,
+        "currency": "IDR",
+        "transactionId": "5fee8f3b-ca5a-418c-9da4-108c029ed4ca",
+        "read": false,
+        "readAt": null,
+        "createdAt": "2026-10-10T06:51:25.254166"
+      },
+      {
+        "id": "c3e1d9b2-7f40-4a8e-b6d2-91a0e5c7f813",
+        "type": "TOPUP_SUCCESS",
+        "title": "Top up berhasil",
+        "body": "Saldo Rp50.000 sudah masuk ke GPay kamu.",
+        "amount": 50000.00,
+        "currency": "IDR",
+        "transactionId": "5d56d612-cc9b-4527-bbaa-2a1f2270eb46",
+        "read": false,
+        "readAt": null,
+        "createdAt": "2026-10-10T06:51:23.645528"
+      }
+    ],
+    "page": 0,
+    "size": 20,
+    "totalElements": 2,
+    "totalPages": 1,
+    "last": true
+  }
+}
+```
+The recipient of the transfer gets `TRANSFER_RECEIVED` · `Dana masuk` · `Kamu menerima transfer Rp10.000.`. Use `transactionId` as the deep link to [§5](#5-get-a-transaction).
+
+### Unread badge
+
+```bash
+curl -s "$NOTIF/api/v1/notifications/unread-count" -H "Authorization: Bearer $TOKEN" | jq '.data'
+# { "unread": 2 }
+```
+
+### Mark as read
+
+```bash
+# One notification (idempotent; 404 if it doesn't exist or isn't yours)
+curl -s -X PATCH "$NOTIF/api/v1/notifications/$NOTIFICATION_ID/read" -H "Authorization: Bearer $TOKEN" | jq
+
+# All of them
+curl -s -X PATCH "$NOTIF/api/v1/notifications/read-all" -H "Authorization: Bearer $TOKEN" | jq '.data'
+# { "updated": 2 }
 ```
 
 ---

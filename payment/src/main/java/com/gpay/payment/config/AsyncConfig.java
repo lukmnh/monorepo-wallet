@@ -11,7 +11,7 @@ import java.util.Map;
 
 @Configuration
 @EnableAsync        // AuditClient.log runs off the request thread
-@EnableScheduling   // PendingTransactionScheduler: expire stale top-ups, reconcile unknown-outcome transfers
+@EnableScheduling   // PendingTransactionScheduler (expiry, reconciliation), OutboxRelayScheduler (notifications)
 public class AsyncConfig {
 
     /**

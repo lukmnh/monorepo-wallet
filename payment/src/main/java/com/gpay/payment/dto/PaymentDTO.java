@@ -1,5 +1,6 @@
 package com.gpay.payment.dto;
 
+import com.gpay.payment.constant.OutboxEventType;
 import com.gpay.payment.constant.TransactionStatus;
 import com.gpay.payment.constant.TransactionType;
 import com.gpay.payment.entity.Transactions;
@@ -52,6 +53,18 @@ public class PaymentDTO {
                     txn.getDescription(), txn.getFailureReason(), txn.getCreatedAt());
         }
     }
+
+    /** Outbox payload for notification-service. counterpartyUserId = transfer recipient, null for top-up. */
+    public record PaymentSucceededEvent(
+            UUID eventId,
+            OutboxEventType eventType,
+            UUID transactionId,
+            UUID userId,
+            UUID counterpartyUserId,
+            BigDecimal amount,
+            String currency,
+            LocalDateTime occurredAt
+    ) {}
 
     /** Gateway callback. All fields are covered by the HMAC signature. */
     public record WebhookPayload(

@@ -9,6 +9,7 @@ import com.gpay.payment.entity.Transactions;
 import com.gpay.payment.exception.PaymentException;
 import com.gpay.payment.repository.TopUpRequestRepository;
 import com.gpay.payment.repository.TransactionRepository;
+import com.gpay.payment.service.NotificationOutboxService;
 import com.gpay.payment.service.WebhookService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -31,17 +32,20 @@ public class WebhookServiceImpl implements WebhookService {
     private final TopUpRequestRepository topupRequestRepository;
     private final WalletClient walletClient;
     private final AuditClient auditClient;
+    private final NotificationOutboxService notificationOutbox;
     private final byte[] gatewaySecret;
 
     public WebhookServiceImpl(TransactionRepository transactionRepository,
                               TopUpRequestRepository topupRequestRepository,
                               WalletClient walletClient,
                               AuditClient auditClient,
+                              NotificationOutboxService notificationOutbox,
                               @Value("${payment.mock-gateway-secret}") String gatewaySecret) {
         this.transactionRepository = transactionRepository;
         this.topupRequestRepository = topupRequestRepository;
         this.walletClient = walletClient;
         this.auditClient = auditClient;
+        this.notificationOutbox = notificationOutbox;
         // An empty HMAC key would make signatures forgeable by anyone
         if (gatewaySecret == null || gatewaySecret.isBlank()) {
             throw new IllegalStateException("MOCK_GATEWAY_SECRET must be set");
@@ -89,6 +93,8 @@ public class WebhookServiceImpl implements WebhookService {
             }
             txn.setStatus(TransactionStatus.SUCCESS);
             txn.setFailureReason(null);
+            // Same TX as the status change; the row lock + terminal check above make this run once per top-up
+            notificationOutbox.topupSucceeded(txn);
             log.info("Topup SUCCESS txnId={} userId={} amount={}", txnId, txn.getUserId(), txn.getAmount());
         } else if (txn.getStatus() == TransactionStatus.PENDING) {
             txn.setStatus(TransactionStatus.FAILED);

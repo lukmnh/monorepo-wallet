@@ -28,3 +28,10 @@ keys/
 # OS
 .DS_Store
 Thumbs.db
+
+node_modules/
+npm-debug.log*
+
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.md

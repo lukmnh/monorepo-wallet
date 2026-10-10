@@ -110,6 +110,7 @@ services:
       WALLET_SERVICE_URL: http://wallet-service:8082
       AUDIT_SERVICE_URL: http://audit-service:8084
       PAYMENT_GATEWAY_URL: http://mock-gateway:8085
+      NOTIFICATION_SERVICE_URL: http://notification-service:8086
       MOCK_GATEWAY_SECRET: ${MOCK_GATEWAY_SECRET}
       DAILY_TRANSFER_LIMIT: ${DAILY_TRANSFER_LIMIT}
       PAYMENT_RATE_LIMIT_PER_MINUTE: 5
@@ -142,6 +143,29 @@ services:
       INTERNAL_API_KEY: ${INTERNAL_API_KEY}
     ports:
       - "8084:8084"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - gpay-network
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: notification/Dockerfile
+    container_name: notification-service
+    env_file: .env
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://${DB_HOST}:${DB_PORT}/${DB_NAME}?currentSchema=notification
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      JWT_ISSUER: ${JWT_ISSUER}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+    secrets:
+      - jwt_public_key
+    ports:
+      - "8086:8086"
     depends_on:
       postgres:
         condition: service_healthy

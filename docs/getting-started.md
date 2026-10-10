@@ -22,7 +22,7 @@ To try the API by hand once it is running, see [api-examples.md](api-examples.md
 | curl, jq | any | Smoke test and API examples |
 | JDK + Maven | 21 + 3.9 | Only if you run a service outside Docker ([§4](#4-run-one-service-from-maven-or-your-ide)) |
 
-Host ports used by default: **8081–8085** (services), **5432** (Postgres), **6379** (Redis).
+Host ports used by default: **8081–8086** (services), **5432** (Postgres), **6379** (Redis).
 
 ---
 
@@ -83,7 +83,7 @@ docker compose ps
 ```
 All 7 containers should be `running` (postgres and redis `healthy`). Then confirm the services finished starting:
 ```bash
-docker compose logs auth-service wallet-service payment-service audit-service mock-gateway \
+docker compose logs auth-service wallet-service payment-service audit-service mock-gateway notification-service \
   | grep -E "Started .*Application|APPLICATION FAILED"
 ```
 You should see 5 `Started ...Application` lines and no `APPLICATION FAILED`.
@@ -92,7 +92,7 @@ Finally, run the end-to-end smoke test:
 ```bash
 ./scripts/smoke-test.sh
 ```
-It registers two new users and exercises login, balance, top-up via the gateway webhook, idempotency, transfer, mutations, refresh and logout. Expected last line: `Result: 18 passed, 0 failed` (exit code 0). It creates fresh users each run, so you can repeat it any time.
+It registers two new users and exercises login, balance, top-up via the gateway webhook, idempotency, transfer, mutations, notifications (inbox, unread badge, mark-read), refresh and logout. Expected last line: `Result: 24 passed, 0 failed` (exit code 0). It creates fresh users each run, so you can repeat it any time.
 
 The stack is ready. Continue with [api-examples.md](api-examples.md) to call the API yourself.
 
@@ -148,8 +148,9 @@ In an IDE, run `AuthApplication` with the same environment variables in the run 
 |---|---|---|
 | auth | `auth` | Redis vars, `JWT_PRIVATE_KEY_PATH`, `JWT_ACCESS_EXPIRY_MINUTES`, `JWT_REFRESH_EXPIRY_DAYS`, `INTERNAL_API_KEY`, `WALLET_SERVICE_URL` |
 | wallets | `wallet` | `JWT_PUBLIC_KEY_PATH`, `INTERNAL_API_KEY` |
-| payment | `payment` | Redis vars, `JWT_PUBLIC_KEY_PATH`, `INTERNAL_API_KEY`, `MOCK_GATEWAY_SECRET`, `WALLET_SERVICE_URL`, `AUDIT_SERVICE_URL`, `PAYMENT_GATEWAY_URL` (all `http://localhost:808x`) |
+| payment | `payment` | Redis vars, `JWT_PUBLIC_KEY_PATH`, `INTERNAL_API_KEY`, `MOCK_GATEWAY_SECRET`, `WALLET_SERVICE_URL`, `AUDIT_SERVICE_URL`, `PAYMENT_GATEWAY_URL`, `NOTIFICATION_SERVICE_URL` (all `http://localhost:808x`) |
 | auditlog | `audit` | `INTERNAL_API_KEY` |
+| notification | `notification` | `JWT_PUBLIC_KEY_PATH`, `INTERNAL_API_KEY` |
 | paymentgateway | — | `MOCK_GATEWAY_SECRET`, `PAYMENT_SERVICE_WEBHOOK_URL` |
 
 Most of these come from `.env` via `source`. Key paths must be **absolute**.
@@ -176,7 +177,10 @@ Postgres only runs `db/migration/` on an empty volume. Apply each new file once,
 ```bash
 set -a; source .env; set +a
 for f in db/migration/V1__0710261200_hardening_constraints.sql \
-         db/migration/V1__0710261500_pending_transfer_index.sql; do
+         db/migration/V1__0710261500_pending_transfer_index.sql \
+         db/migration/V1__1010261000_init_schema_notification.sql \
+         db/migration/V1__1010261001_init_table_notifications.sql \
+         db/migration/V1__1010261002_init_table_outbox_events.sql; do
   docker compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 < "$f"
 done
 ```
@@ -227,7 +231,7 @@ docker compose exec redis redis-cli -a "$REDIS_PASSWORD" DEL login:fail:user:<us
 | Symptom | Cause / fix |
 |---|---|
 | `port is already allocated` (5432 / 6379) | Another program uses the port. Set `POSTGRES_HOST_PORT` / `REDIS_HOST_PORT` in `.env` ([§2 Step 4](#step-4--check-that-the-host-ports-are-free)) |
-| `port is already allocated` (8081–8085) | Free that port, or change the host side of that service's `ports:` in `docker-compose.yaml` |
+| `port is already allocated` (8081–8086) | Free that port, or change the host side of that service's `ports:` in `docker-compose.yaml` |
 | `secret "jwt_private_key"... no such file` | Keys missing: run `./scripts/generate-jwt-keys.sh` |
 | `Cannot load JWT ... key` at startup | Key file not in PEM PKCS#8 / X.509 format: delete `keys/` and regenerate |
 | `INTERNAL_API_KEY must be set` / `MOCK_GATEWAY_SECRET must be set` / `Could not resolve placeholder` | A variable is missing from `.env` (compose passes an empty string, which is rejected on purpose). Compare with `.env.example` |

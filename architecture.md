@@ -12,7 +12,7 @@ Microservices wallet system: register/login, top-up via a (mock) payment gateway
 |---|---|
 | Language / runtime | Java 21 (Eclipse Temurin) |
 | Framework | Spring Boot 3.5.14 (Web MVC, Data JPA, Security, Validation, Data Redis) |
-| Build | Maven multi-module (`wallet-parent` → 5 independent modules, no cross-module dependencies) |
+| Build | Maven multi-module (`wallet-parent` → 6 independent modules, no cross-module dependencies) |
 | Auth tokens | JJWT 0.12.5, **RS256** (private key in auth-service only) |
 | Database | PostgreSQL 16 — one instance, one schema per service |
 | Cache / locks | Redis 7 (payment-service: idempotency, limits; auth-service: login lockout) |
@@ -32,6 +32,7 @@ monorepo-wallet/
 ├── payment/                      # payment-service    :8083
 ├── auditlog/                     # audit-service      :8084
 ├── paymentgateway/               # mock-gateway       :8085
+├── notification/                 # notification-service :8086
 ├── db/migration/                 # raw SQL, mounted into postgres initdb
 ├── scripts/generate-jwt-keys.sh  # RS256 key pair → keys/ (git- and docker-ignored)
 └── docker-compose.yaml
@@ -64,6 +65,7 @@ flowchart LR
         AUTH[auth-service :8081]
         WAL[wallet-service :8082]
         PAY[payment-service :8083]
+        NOTIF[notification-service :8086]
     end
 
     subgraph Internal
@@ -77,11 +79,13 @@ flowchart LR
     Client -->|register / login / refresh / logout| AUTH
     Client -->|RS256 JWT: balance, mutations| WAL
     Client -->|RS256 JWT: topup, transfer, get txn| PAY
+    Client -->|RS256 JWT: inbox, unread count, mark read| NOTIF
 
     AUTH -->|X-Internal-Api-Key<br/>create wallet on register| WAL
     PAY -->|X-Internal-Api-Key<br/>credit / transfer| WAL
     PAY -.->|async, X-Internal-Api-Key<br/>audit event| AUD
     PAY -->|POST /gateway/topup| GW
+    PAY -.->|outbox relay, X-Internal-Api-Key<br/>payment succeeded| NOTIF
     GW -.->|async webhook + HMAC,<br/>retried| PAY
 
     AUTH --> PG
@@ -90,6 +94,7 @@ flowchart LR
     PAY --> PG
     PAY -->|idempotency, limits| RD
     AUD --> PG
+    NOTIF --> PG
 ```
 
 ### Service responsibilities
@@ -98,7 +103,8 @@ flowchart LR
 |---|---|---|---|---|
 | **auth** | `auth.users`, `auth.refresh_tokens`, Redis `login:fail:*` | `POST /api/v1/auth/{register,login,refresh,logout}` | — | wallets (create wallet) |
 | **wallets** | `wallet.wallets`, `wallet.mutations` | `GET /api/v1/wallet/balance`, `GET /api/v1/wallet/mutations?page&size` | `POST /api/v1/internal/wallet/{create,credit,debit,transfer}` (all idempotent) | — |
-| **payment** | `payment.transactions`, `payment.topup_requests`, `payment.transfer_requests`, Redis `idempotency:*`, `rate:*`, `daily:*` | `POST /api/v1/topup`, `POST /api/v1/transfer`, `GET /api/v1/transactions/{id}` | `POST /api/v1/webhook/topup` (HMAC) | wallets, auditlog, gateway |
+| **payment** | `payment.transactions`, `payment.topup_requests`, `payment.transfer_requests`, `payment.outbox_events`, Redis `idempotency:*`, `rate:*`, `daily:*` | `POST /api/v1/topup`, `POST /api/v1/transfer`, `GET /api/v1/transactions/{id}` | `POST /api/v1/webhook/topup` (HMAC) | wallets, auditlog, gateway, notification |
+| **notification** | `notification.notifications` | `GET /api/v1/notifications?page&size`, `GET /api/v1/notifications/unread-count`, `PATCH /api/v1/notifications/{id}/read`, `PATCH /api/v1/notifications/read-all` | `POST /api/v1/internal/notifications/events` (idempotent) | push provider (stub) |
 | **auditlog** | `audit.audit_logs` | — | `POST /api/v1/internal/audit` | — |
 | **paymentgateway** | stateless | — | `POST /gateway/topup` | payment (webhook) |
 
@@ -243,6 +249,49 @@ sequenceDiagram
 
 Status transitions use `UPDATE … WHERE status = 'PENDING'`, so the request thread, reconciler, webhook and expiry job can never overwrite each other's terminal status.
 
+### 5.4 Success notifications (transactional outbox)
+
+```mermaid
+sequenceDiagram
+    participant P as payment-service
+    participant DB as payment schema
+    participant N as notification-service
+    participant C as Client app
+
+    Note over P,DB: same DB transaction as the SUCCESS transition
+    P->>DB: UPDATE transactions → SUCCESS (webhook TX / resolvePending CAS won)
+    P->>DB: INSERT outbox_events(TOPUP_SUCCEEDED | TRANSFER_SUCCEEDED) ON CONFLICT DO NOTHING
+    P->>DB: COMMIT
+
+    loop every OUTBOX_POLL_INTERVAL_MS (2 s)
+        P->>DB: SELECT due PENDING … FOR UPDATE SKIP LOCKED, lease 60 s, COMMIT
+        P->>N: POST /internal/notifications/events {eventId, type, txnId, userId, counterpartyUserId, amount, IDR, occurredAt}
+        N->>N: INSERT per recipient ON CONFLICT (transaction_id, type) DO NOTHING
+        N-->>P: 200 {created}
+        alt 200
+            P->>DB: → PUBLISHED
+        else timeout / 5xx / 401
+            P->>DB: attempts+1, backoff 5 s · 2ⁿ (max 30 min); DEAD after OUTBOX_MAX_ATTEMPTS
+        else 400 (payload rejected)
+            P->>DB: → DEAD
+        end
+    end
+    N-->>C: push after commit (async, best-effort)
+    C->>N: GET /notifications, /unread-count
+```
+
+| Event | Recipient(s) | Notification (stored text) |
+|---|---|---|
+| `TOPUP_SUCCEEDED` | payer | `TOPUP_SUCCESS` · *Top up berhasil* · "Saldo Rp50.000 sudah masuk ke GPay kamu." |
+| `TRANSFER_SUCCEEDED` | sender | `TRANSFER_SENT` · *Transfer berhasil* · "Kamu berhasil mengirim Rp10.000." |
+| | recipient | `TRANSFER_RECEIVED` · *Dana masuk* · "Kamu menerima transfer Rp10.000." |
+
+Guarantees:
+- **No success without an event and no event without a success.** Both rows commit together. A transfer only records the event if *this* actor won the `PENDING → SUCCESS` compare-and-set, so the request thread and the reconciler never both emit it.
+- **At-least-once delivery, exactly-once effect.** The relay can re-send (lease expiry, lost ack), but notification-service dedupes on `UNIQUE (transaction_id, type)` and still answers 200.
+- **Payments never wait on notifications.** If notification-service is down, events queue in `outbox_events` and drain when it recovers.
+- Only successes notify (as requested); failures and expiries are visible through `GET /transactions/{id}`.
+
 ---
 
 ## 6. Cross-cutting concerns
@@ -268,6 +317,7 @@ Status transitions use `UPDATE … WHERE status = 'PENDING'`, so the request thr
 |---|---|---|---|
 | payment | `expireStaleTopups` | every `PAYMENT_SCHEDULER_INTERVAL_MS` (60 s) | `PENDING` TOPUP older than `PENDING_EXPIRE_MINUTES` → `EXPIRED` + reason |
 | payment | `reconcilePendingTransfers` | every 60 s | Re-sends `PENDING` TRANSFER older than `TRANSFER_RECONCILE_AFTER_SECONDS`, using the original `traceId` in logs |
+| payment | `OutboxRelayScheduler.relay` | every `OUTBOX_POLL_INTERVAL_MS` (2 s) | Delivers due `outbox_events` to notification-service; `SKIP LOCKED` makes concurrent replicas safe |
 | auth | `RefreshTokenCleanupJob` | `JWT_CLEANUP_CRON` (03:00) | Deletes expired refresh tokens (revoked-but-unexpired kept for reuse detection) |
 
 Jobs run on a single instance. Running several payment-service replicas is still safe because every transition is conditional, but the work would be duplicated.
@@ -286,7 +336,7 @@ Jobs run on a single instance. Running several payment-service replicas is still
 | Validation, malformed JSON, missing header/param, bad idempotency key, self-transfer, bad webhook | 400 |
 | Invalid credentials / token, bad webhook signature | 401 |
 | Inactive account, wrong internal API key | 403 |
-| Unknown path / transaction | 404 |
+| Unknown path / transaction / notification | 404 |
 | Duplicate username/email, idempotency key in flight | 409 |
 | Transaction `FAILED`/`EXPIRED` (body includes the transaction), daily limit, key reused with a different request | 422 |
 | Payment rate limit, login lockout | 429 + `Retry-After` |
@@ -309,6 +359,7 @@ flowchart TB
         payment[payment-service :8083<br/>secret: jwt_public_key]
         audit[audit-service :8084]
         gw[mock-gateway :8085]
+        notif[notification-service :8086<br/>secret: jwt_public_key]
     end
     auth -- healthy --> postgres
     auth -- healthy --> redis
@@ -319,6 +370,7 @@ flowchart TB
     payment -- healthy --> redis
     payment -- started --> wallet
     gw -- started --> payment
+    notif -- healthy --> postgres
 ```
 
 - Images: a `maven:3.9.9-eclipse-temurin-21-alpine` build stage (`mvn package -pl <module> -am`), then `eclipse-temurin:21-jre-alpine` running as non-root `appuser`.
@@ -334,12 +386,12 @@ flowchart TB
 | `POSTGRES_HOST_PORT`, `REDIS_HOST_PORT` | compose (host side of the port mapping only) | 5432, 6379 |
 | `REDIS_PASSWORD` | redis, auth, payment | — |
 | `JWT_PRIVATE_KEY_PATH` | auth | `keys/jwt_private.pem` (compose: `/run/secrets/jwt_private_key`) |
-| `JWT_PUBLIC_KEY_PATH` | wallets, payment | `keys/jwt_public.pem` (compose: `/run/secrets/jwt_public_key`) |
-| `JWT_ISSUER` | auth (sets), wallets + payment (require) | `gpay-auth` |
+| `JWT_PUBLIC_KEY_PATH` | wallets, payment, notification | `keys/jwt_public.pem` (compose: `/run/secrets/jwt_public_key`) |
+| `JWT_ISSUER` | auth (sets), wallets + payment + notification (require) | `gpay-auth` |
 | `JWT_ACCESS_EXPIRY_MINUTES`, `JWT_REFRESH_EXPIRY_DAYS` | auth | — |
 | `JWT_CLEANUP_CRON` | auth | `0 0 3 * * *` |
 | `LOGIN_MAX_ATTEMPTS_PER_USER`, `LOGIN_MAX_ATTEMPTS_PER_IP`, `LOGIN_LOCK_MINUTES` | auth | 5, 20, 15 |
-| `INTERNAL_API_KEY` | auth, wallets, payment, auditlog | — (blank fails startup) |
+| `INTERNAL_API_KEY` | auth, wallets, payment, auditlog, notification | — (blank fails startup) |
 | `MOCK_GATEWAY_SECRET` | payment, gateway | — (blank fails startup) |
 | `DAILY_TRANSFER_LIMIT` | payment | 10000000 |
 | `PAYMENT_RATE_LIMIT_PER_MINUTE` | payment | 5 |
@@ -350,6 +402,8 @@ flowchart TB
 | `WALLET_SERVICE_URL` | auth, payment | `http://localhost:8082` |
 | `AUDIT_SERVICE_URL`, `PAYMENT_GATEWAY_URL` | payment | `http://localhost:808x` |
 | `PAYMENT_SERVICE_WEBHOOK_URL` | gateway | `http://payment-service:8083/api/v1/webhook/topup` |
+| `NOTIFICATION_SERVICE_URL` | payment | `http://localhost:8086` |
+| `OUTBOX_POLL_INTERVAL_MS`, `OUTBOX_BATCH_SIZE`, `OUTBOX_MAX_ATTEMPTS` | payment | 2000, 50, 10 |
 
 ### HTTP client timeouts
 
@@ -375,6 +429,8 @@ flowchart TB
 | Synchronous wallet provisioning in register | Every user has a wallet; no orphan users | Registration depends on wallet-service availability (503) |
 | Redis login lockout per user + IP | Stops password guessing without DB writes | Known usernames can be locked by an attacker for 15 min |
 | Best-effort async audit | Audit must not slow or break payments | Events lost if audit is down (no queue/outbox) |
+| Notifications via transactional outbox + polling relay (no broker) | Atomic with the status change; reuses Postgres, no Kafka/RabbitMQ to operate | ~2 s latency; polling load on `outbox_events` (partial index keeps it cheap) |
+| Notification text rendered at ingest and stored | Inbox matches the push; copy changes don't rewrite history | No per-user language yet (Bahasa Indonesia only) |
 
 ---
 
@@ -390,4 +446,7 @@ flowchart TB
 | Login lockout can be triggered by others | 15-min denial for a targeted username | CAPTCHA / progressive delays instead of a hard lock |
 | Behind a reverse proxy, the client IP is the proxy's | Per-IP lockout becomes global | Enable `server.forward-headers-strategy` with a trusted proxy |
 | Rate limit is a fixed 1-minute window | Bursts at window edges | Sliding window / token bucket |
-| No automated tests beyond `contextLoads` | Regressions caught late | Testcontainers integration tests for the flows above |
+| Push channel is a logging stub (`LoggingPushSender`) | No device push yet; inbox works | Device-token registry + FCM/APNs `PushSender` implementation |
+| Notifications show no counterparty name | "Kamu menerima transfer Rp10.000" instead of "… dari Alice" | Carry sender/recipient display names in the event (payment has only user ids) |
+| No retention for `notifications` / published `outbox_events` | Tables grow unbounded | Nightly purge (e.g. inbox 90 days, outbox 7 days) |
+| Only unit tests for core logic (86, mocked I/O) + smoke test; no DB/Redis integration tests | JPA queries, Lua scripts, `ON CONFLICT`, `SKIP LOCKED` verified only end to end | Testcontainers integration tests (see [docs/testing.md §5](docs/testing.md#5-coverage-matrix)) |

@@ -3,7 +3,7 @@
 # Creates two fresh users (unique suffix), tops up, transfers, and checks every step.
 #
 # Usage:   ./scripts/smoke-test.sh
-# Env:     AUTH_URL WALLET_URL PAYMENT_URL   (defaults: http://localhost:8081 / 8082 / 8083)
+# Env:     AUTH_URL WALLET_URL PAYMENT_URL NOTIFICATION_URL   (defaults: http://localhost:8081 / 8082 / 8083 / 8086)
 # Needs:   curl, jq
 # Exit:    0 = all checks passed, 1 = at least one failed
 set -uo pipefail
@@ -11,6 +11,7 @@ set -uo pipefail
 AUTH_URL="${AUTH_URL:-http://localhost:8081}"
 WALLET_URL="${WALLET_URL:-http://localhost:8082}"
 PAYMENT_URL="${PAYMENT_URL:-http://localhost:8083}"
+NOTIFICATION_URL="${NOTIFICATION_URL:-http://localhost:8086}"
 
 for bin in curl jq; do
   command -v "$bin" >/dev/null || { echo "Missing dependency: $bin" >&2; exit 1; }
@@ -41,6 +42,7 @@ echo "Waiting for services..."
 wait_for_service auth-service    "$AUTH_URL/api/v1/auth/login"
 wait_for_service wallet-service  "$WALLET_URL/api/v1/wallet/balance"
 wait_for_service payment-service "$PAYMENT_URL/api/v1/transactions/00000000-0000-0000-0000-000000000000"
+wait_for_service notification-service "$NOTIFICATION_URL/api/v1/notifications"
 
 echo "1. Register"
 ALICE_NAME="alice${RUN_ID}"; BOB_NAME="bob${RUN_ID}"
@@ -96,7 +98,27 @@ echo "7. Mutation history"
 check "mutations -> 200" 200 "$(request GET "$WALLET_URL/api/v1/wallet/mutations?page=0&size=10" "${AUTH[@]}")"
 check "2 ledger entries (CREDIT top-up, DEBIT transfer)" "DEBIT,CREDIT" "$(jq -r '[.data.content[].type] | join(",")' "$BODY")"
 
-echo "8. Refresh and logout"
+echo "8. Notifications (delivered via payment outbox, ~2 s)"
+TYPES=""
+for _ in $(seq 1 15); do
+  request GET "$NOTIFICATION_URL/api/v1/notifications?page=0&size=10" "${AUTH[@]}" >/dev/null
+  TYPES="$(jq -r '[.data.content[].type] | join(",")' "$BODY")"; [[ "$TYPES" == "TRANSFER_SENT,TOPUP_SUCCESS" ]] && break; sleep 1
+done
+check "inbox: transfer + top-up, newest first" "TRANSFER_SENT,TOPUP_SUCCESS" "$TYPES"
+check "top-up body shows nominal" "Saldo Rp50.000 sudah masuk ke GPay kamu." "$(jq -r '.data.content[1].body' "$BODY")"
+request GET "$NOTIFICATION_URL/api/v1/notifications/unread-count" "${AUTH[@]}" >/dev/null
+check "unread badge is 2" 2 "$(field .data.unread)"
+check "read-all -> 200, 2 updated" "200 2" "$(request PATCH "$NOTIFICATION_URL/api/v1/notifications/read-all" "${AUTH[@]}") $(field .data.updated)"
+request GET "$NOTIFICATION_URL/api/v1/notifications/unread-count" "${AUTH[@]}" >/dev/null
+check "unread badge is 0" 0 "$(field .data.unread)"
+request POST "$AUTH_URL/api/v1/auth/login" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$BOB_NAME\",\"password\":\"password123\"}" >/dev/null
+BOB_TOKEN="$(field .data.accessToken)"
+request GET "$NOTIFICATION_URL/api/v1/notifications?page=0&size=10" -H "Authorization: Bearer $BOB_TOKEN" >/dev/null
+check "recipient notified with nominal" "TRANSFER_RECEIVED Kamu menerima transfer Rp10.000." \
+  "$(jq -r '.data.content[0] | "\(.type) \(.body)"' "$BODY")"
+
+echo "9. Refresh and logout"
 check "refresh -> 200" 200 "$(request POST "$AUTH_URL/api/v1/auth/refresh" -H 'Content-Type: application/json' \
   -d "{\"refreshToken\":\"$REFRESH\"}")"
 NEW_REFRESH="$(field .data.refreshToken)"

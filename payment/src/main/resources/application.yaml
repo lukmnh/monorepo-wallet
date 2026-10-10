@@ -30,6 +30,10 @@ spring:
   task:
     execution:
       thread-name-prefix: async-
+    scheduling:
+      # expiry + reconciler + outbox relay: a slow reconcile must not stall notification delivery
+      pool:
+        size: 3
 
 jwt:
   # RS256 public key (X.509 PEM); verify-only
@@ -43,6 +47,7 @@ services:
   wallet-url: ${WALLET_SERVICE_URL:http://localhost:8082}
   audit-url: ${AUDIT_SERVICE_URL:http://localhost:8084}
   payment-gateway-url: ${PAYMENT_GATEWAY_URL:http://localhost:8085}
+  notification-url: ${NOTIFICATION_SERVICE_URL:http://localhost:8086}
 
 payment:
   mock-gateway-secret: ${MOCK_GATEWAY_SECRET}
@@ -53,6 +58,10 @@ payment:
   # Background jobs: top-up expiry + transfer reconciliation
   scheduler-interval-ms: ${PAYMENT_SCHEDULER_INTERVAL_MS:60000}
   transfer-reconcile-after-seconds: ${TRANSFER_RECONCILE_AFTER_SECONDS:120}
+  # Transactional outbox -> notification-service
+  outbox-poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:2000}
+  outbox-batch-size: ${OUTBOX_BATCH_SIZE:50}
+  outbox-max-attempts: ${OUTBOX_MAX_ATTEMPTS:10}
 
 logging:
   pattern:
