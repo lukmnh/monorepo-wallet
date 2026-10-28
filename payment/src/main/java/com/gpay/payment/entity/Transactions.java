@@ -12,7 +12,9 @@ import java.time.LocalDateTime;
 import java.util.UUID;
 
 @Entity
-@Table(name = "transactions", schema = "payment")
+@Table(name = "transactions", schema = "payment",
+        uniqueConstraints = @UniqueConstraint(name = "uq_transactions_user_idem",
+                columnNames = {"user_id", "idempotency_key"}))
 @Getter
 @Setter
 @Builder
@@ -23,7 +25,8 @@ public class Transactions {
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
-    @Column(name = "idempotency_key", nullable = false, unique = true, length = 100)
+    // Unique per user, not globally (see uq_transactions_user_idem)
+    @Column(name = "idempotency_key", nullable = false, length = 100)
     private String idempotencyKey;
 
     @Column(name = "user_id", nullable = false)
@@ -43,6 +46,10 @@ public class Transactions {
 
     @Column(length = 255)
     private String description;
+
+    // Why the transaction ended FAILED/EXPIRED; null otherwise
+    @Column(name = "failure_reason", length = 255)
+    private String failureReason;
 
     @Column(name = "trace_id", length = 100)
     private String traceId;

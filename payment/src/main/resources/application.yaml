@@ -13,6 +13,8 @@ spring:
       maximum-pool-size: 20
       minimum-idle: 5
   jpa:
+    # No DB connection held across HTTP calls to gateway/wallet; services manage their own TX boundaries
+    open-in-view: false
     hibernate:
       ddl-auto: validate
     show-sql: false
@@ -25,9 +27,18 @@ spring:
       port: ${SPRING_REDIS_PORT:6379}
       password: ${SPRING_REDIS_PASSWORD}
       timeout: 2000ms
+  task:
+    execution:
+      thread-name-prefix: async-
+    scheduling:
+      # expiry + reconciler + outbox relay: a slow reconcile must not stall notification delivery
+      pool:
+        size: 3
 
 jwt:
-  secret: ${JWT_SECRET}
+  # RS256 public key (X.509 PEM); verify-only
+  public-key-path: ${JWT_PUBLIC_KEY_PATH:keys/jwt_public.pem}
+  issuer: ${JWT_ISSUER:gpay-auth}
 
 internal:
   api-key: ${INTERNAL_API_KEY}
@@ -36,6 +47,7 @@ services:
   wallet-url: ${WALLET_SERVICE_URL:http://localhost:8082}
   audit-url: ${AUDIT_SERVICE_URL:http://localhost:8084}
   payment-gateway-url: ${PAYMENT_GATEWAY_URL:http://localhost:8085}
+  notification-url: ${NOTIFICATION_SERVICE_URL:http://localhost:8086}
 
 payment:
   mock-gateway-secret: ${MOCK_GATEWAY_SECRET}
@@ -43,6 +55,13 @@ payment:
   rate-limit-per-minute: ${PAYMENT_RATE_LIMIT_PER_MINUTE:5}
   topup-timeout-seconds: ${TOPUP_TIMEOUT_SECONDS:5}
   pending-expire-minutes: ${PENDING_EXPIRE_MINUTES:60}
+  # Background jobs: top-up expiry + transfer reconciliation
+  scheduler-interval-ms: ${PAYMENT_SCHEDULER_INTERVAL_MS:60000}
+  transfer-reconcile-after-seconds: ${TRANSFER_RECONCILE_AFTER_SECONDS:120}
+  # Transactional outbox -> notification-service
+  outbox-poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:2000}
+  outbox-batch-size: ${OUTBOX_BATCH_SIZE:50}
+  outbox-max-attempts: ${OUTBOX_MAX_ATTEMPTS:10}
 
 logging:
   pattern:

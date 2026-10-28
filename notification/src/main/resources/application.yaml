@@ -1,0 +1,41 @@
+server:
+  port: 8086
+
+spring:
+  application:
+    name: notification
+  datasource:
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  task:
+    execution:
+      thread-name-prefix: push-
+
+jwt:
+  # RS256 public key (X.509 PEM); verify-only
+  public-key-path: ${JWT_PUBLIC_KEY_PATH:keys/jwt_public.pem}
+  issuer: ${JWT_ISSUER:gpay-auth}
+
+internal:
+  # No default on purpose: startup fails if the key is not configured
+  api-key: ${INTERNAL_API_KEY}
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] [traceId=%X{traceId}] [userId=%X{userId}] %-5level %logger{36} - %msg%n"
+  level:
+    com.gpay: INFO

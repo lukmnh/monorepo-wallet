@@ -10,17 +10,19 @@ public class AuthDTO {
             @NotBlank(message = "Username is required")
             @Size(min = 3, max = 50, message = "Username must be between 3 and 50 characters")
             @Pattern(
-                    regexp = "^(?!\\\\d+$)[a-zA-Z0-9]+$",
-                    message = "Username cannot be only numbers"
+                    regexp = "^(?!\\d+$)[a-zA-Z0-9]+$",
+                    message = "Username must be alphanumeric and cannot be only numbers"
             )
             String username,
 
             @NotBlank(message = "Email is required")
             @Email(message = "Invalid email format")
+            @Size(max = 100, message = "Email must be at most 100 characters")
             String email,
 
             @NotBlank(message = "Password is required")
-            @Size(min = 8, message = "Password must be at least 8 characters")
+            // BCrypt only accepts up to 72 bytes; longer input makes the encoder throw
+            @Size(min = 8, max = 72, message = "Password must be between 8 and 72 characters")
             String password
     ) {}
 

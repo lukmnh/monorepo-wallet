@@ -4,7 +4,7 @@ import com.gpay.auth.dto.AuthDTO.*;
 
 public interface AuthService {
     RegisterResponse register(RegisterRequest request);
-    TokenResponse login(LoginRequest request);
+    TokenResponse login(LoginRequest request, String clientIp);
     TokenResponse refreshToken(RefreshTokenRequest request);
     void logout(String refreshTokenStr);
 }

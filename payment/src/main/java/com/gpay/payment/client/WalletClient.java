@@ -30,11 +30,6 @@ public class WalletClient {
         this.internalApiKey = internalApiKey;
     }
 
-    public void createWallet(UUID userId) {
-        String url = walletBaseUrl + "/api/v1/internal/wallet/create?userId=" + userId;
-        restTemplate.exchange(url, HttpMethod.POST, new HttpEntity<>(buildHeaders()), Map.class);
-        log.info("Wallet created for userId={}", userId);
-    }
 
     public void credit(UUID userId, BigDecimal amount, String referenceId, String description) {
         String url = walletBaseUrl + "/api/v1/internal/wallet/credit";

@@ -29,12 +29,11 @@ public class WalletServiceImpl implements WalletService {
     @Override
     @Transactional
     public BalanceResponse createWallet(UUID userId) {
-        if (walletRepository.findByUserId(userId).isPresent()) {
-            throw new WalletException.WalletAlreadyExistsException("Wallet already exists for user: " + userId);
-        }
-        Wallets wallet = Wallets.builder().userId(userId).build();
-        wallet = walletRepository.save(wallet);
-        log.info("Wallet created for userId={}", userId);
+        // Idempotent: auth-service calls this on every registration attempt, retries must not fail
+        walletRepository.insertIfAbsent(userId);
+        Wallets wallet = walletRepository.findByUserId(userId)
+                .orElseThrow(() -> new WalletException.WalletNotFoundException("Wallet not found for userId: " + userId));
+        log.info("Wallet ensured for userId={}", userId);
         return toBalanceResponse(wallet);
     }
 
@@ -63,16 +62,13 @@ public class WalletServiceImpl implements WalletService {
     @Override
     @Transactional
     public BalanceResponse credit(CreditDebitRequest request) {
-        if (request.referenceId() != null && mutationRepository.existsByReferenceId(request.referenceId())) {
-            log.warn("Duplicate credit referenceId={}, skipping", request.referenceId());
-            Wallets wallet = walletRepository.findByUserId(request.userId())
-                    .orElseThrow(() -> new WalletException
-                            .WalletNotFoundException("Wallet not found"));
-            return toBalanceResponse(wallet);
-        }
-
         Wallets wallet = walletRepository.findByUserIdForUpdate(request.userId())
                 .orElseThrow(() -> new WalletException.WalletNotFoundException("Wallet not found for userId: " + request.userId()));
+
+        if (isDuplicate(wallet, Type.CREDIT, request.referenceId())) {
+            log.warn("Duplicate credit referenceId={}, skipping", request.referenceId());
+            return toBalanceResponse(wallet);
+        }
 
         BigDecimal before = wallet.getBalance();
         BigDecimal after = before.add(request.amount());
@@ -91,6 +87,11 @@ public class WalletServiceImpl implements WalletService {
     public BalanceResponse debit(CreditDebitRequest request) {
         Wallets wallet = walletRepository.findByUserIdForUpdate(request.userId())
                 .orElseThrow(() -> new WalletException.WalletNotFoundException("Wallet not found for userId: " + request.userId()));
+
+        if (isDuplicate(wallet, Type.DEBIT, request.referenceId())) {
+            log.warn("Duplicate debit referenceId={}, skipping", request.referenceId());
+            return toBalanceResponse(wallet);
+        }
 
         if (wallet.getBalance().compareTo(request.amount()) < 0) {
             throw new WalletException.InsufficientBalanceException(
@@ -129,6 +130,12 @@ public class WalletServiceImpl implements WalletService {
 
         Wallets fromWallet = fromId.equals(firstLock) ? first : second;
         Wallets toWallet = toId.equals(firstLock) ? first : second;
+
+        // Both legs are written atomically, so an existing DEBIT leg means the whole transfer is done
+        if (isDuplicate(fromWallet, Type.DEBIT, request.referenceId())) {
+            log.warn("Duplicate transfer referenceId={}, skipping", request.referenceId());
+            return;
+        }
 
         if (fromWallet.getBalance().compareTo(request.amount()) < 0) {
             throw new WalletException.InsufficientBalanceException(
@@ -169,19 +176,21 @@ public class WalletServiceImpl implements WalletService {
         mutationRepository.save(mutation);
     }
 
+    // Called under the wallet row lock, so concurrent duplicates are serialized; the UNIQUE constraint is the backstop
+    private boolean isDuplicate(Wallets wallet, Type type, String referenceId) {
+        return referenceId != null
+                && mutationRepository.existsByWalletIdAndReferenceIdAndType(wallet.getId(), referenceId, type);
+    }
+
     private Wallets findWalletByUserId(UUID userId) {
         return walletRepository.findByUserId(userId)
                 .orElseGet(() -> {
-                    try {
-                        log.info("Wallet not found for userId={}, auto-creating", userId);
-                        return walletRepository.save(
-                                Wallets.builder().userId(userId).build());
-                    } catch (Exception e) {
-                        log.warn("Race condition on wallet create for userId={}, fetching existing", userId);
-                        return walletRepository.findByUserId(userId)
-                                .orElseThrow(() -> new WalletException
-                                        .WalletNotFoundException("Wallet not found for userId: " + userId));
-                    }
+                    log.info("Wallet not found for userId={}, auto-creating", userId);
+                    // ON CONFLICT DO NOTHING: a concurrent first access cannot abort this transaction
+                    walletRepository.insertIfAbsent(userId);
+                    return walletRepository.findByUserId(userId)
+                            .orElseThrow(() -> new WalletException
+                                    .WalletNotFoundException("Wallet not found for userId: " + userId));
                 });
     }
 

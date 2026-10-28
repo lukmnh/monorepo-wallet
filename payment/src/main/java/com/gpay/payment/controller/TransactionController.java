@@ -29,12 +29,11 @@ public class TransactionController {
         Transactions txn = transactionRepository.findById(id)
                 .orElseThrow(() -> new PaymentException.TransactionNotFoundException("Transaction not found"));
 
+        // Same 404 for "not yours" and "does not exist": no ID probing
         if (!txn.getUserId().equals(userId)) {
             throw new PaymentException.TransactionNotFoundException("Transaction not found");
         }
 
-        return ResponseEntity.ok(ApiResponse.ok("Transaction retrieved",
-                new TransactionResponse(txn.getId(), txn.getType(), txn.getStatus(),
-                        txn.getAmount(), txn.getDescription(), txn.getCreatedAt())));
+        return ResponseEntity.ok(ApiResponse.ok("Transaction retrieved", TransactionResponse.from(txn)));
     }
 }

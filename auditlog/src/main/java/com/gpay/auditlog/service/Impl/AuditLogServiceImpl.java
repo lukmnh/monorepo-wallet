@@ -45,7 +45,9 @@ public class AuditLogServiceImpl implements AuditLogService {
         try {
             return objectMapper.writeValueAsString(obj);
         } catch (JsonProcessingException e) {
-            return obj.toString();
+            // obj.toString() is not valid JSON and would make the jsonb insert fail; drop the payload instead
+            log.warn("Audit payload not serializable, storing null: {}", e.getMessage());
+            return null;
         }
     }
 }

@@ -1,56 +1,63 @@
 package com.gpay.payment.service.Impl;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.gpay.payment.exception.PaymentException;
 import com.gpay.payment.service.IdempotencyService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataAccessException;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
-import java.util.Optional;
+import java.util.List;
+import java.util.UUID;
 
 @Service
 @Slf4j
 @RequiredArgsConstructor
 public class IdempotencyServiceImpl implements IdempotencyService {
-    private static final String PREFIX = "idempotency:";
     private static final String LOCK_PREFIX = "idempotency:lock:";
-    private static final Duration LOCK_TTL = Duration.ofSeconds(30);
-    private static final Duration RESPONSE_TTL = Duration.ofHours(24);
+    // Longer than the slowest request path (wallet: 2 attempts x (3s connect + 10s read))
+    private static final Duration LOCK_TTL = Duration.ofSeconds(60);
+    private static final int MAX_KEY_LENGTH = 100;   // payment.transactions.idempotency_key VARCHAR(100)
+
+    // Delete only if we still own the lock (it may have expired and been taken by another request)
+    private static final RedisScript<Long> RELEASE_IF_OWNER = new DefaultRedisScript<>(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
+            Long.class);
 
     private final StringRedisTemplate redisTemplate;
-    private final ObjectMapper objectMapper;
 
     @Override
-    public boolean tryLock(String idempotencyKey) {
-        String lockKey = LOCK_PREFIX + idempotencyKey;
-        Boolean acquired = redisTemplate.opsForValue()
-                .setIfAbsent(lockKey, "PROCESSING", LOCK_TTL);
-        return Boolean.TRUE.equals(acquired);
-    }
-
-    @Override
-    public <T> void saveResponse(String idempotencyKey, T response) {
+    public String tryLock(UUID userId, String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank() || idempotencyKey.length() > MAX_KEY_LENGTH) {
+            throw new PaymentException.InvalidIdempotencyKeyException(
+                    "X-Idempotency-Key must be 1-" + MAX_KEY_LENGTH + " characters");
+        }
+        String token = UUID.randomUUID().toString();
         try {
-            String json = objectMapper.writeValueAsString(response);
-            redisTemplate.opsForValue().set(PREFIX + idempotencyKey, json, RESPONSE_TTL);
-            redisTemplate.opsForValue().set(LOCK_PREFIX + idempotencyKey, "DONE", RESPONSE_TTL);
-        } catch (JsonProcessingException e) {
-            log.error("Failed to serialize idempotency response for key={}", idempotencyKey, e);
+            Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey(userId, idempotencyKey), token, LOCK_TTL);
+            return Boolean.TRUE.equals(acquired) ? token : null;
+        } catch (DataAccessException e) {
+            // Fail open: the DB unique constraint + replay still guarantee exactly-once
+            log.error("Idempotency lock skipped, Redis unavailable: {}", e.getMessage());
+            return token;
         }
     }
 
     @Override
-    public Optional<String> getResponse(String idempotencyKey) {
-        String value = redisTemplate.opsForValue().get(PREFIX + idempotencyKey);
-        return Optional.ofNullable(value);
+    public void release(UUID userId, String idempotencyKey, String lockToken) {
+        try {
+            redisTemplate.execute(RELEASE_IF_OWNER, List.of(lockKey(userId, idempotencyKey)), lockToken);
+        } catch (DataAccessException e) {
+            log.warn("Idempotency lock not released (expires in {}s): {}", LOCK_TTL.toSeconds(), e.getMessage());
+        }
     }
 
-    @Override
-    public boolean exists(String idempotencyKey) {
-        return Boolean.TRUE.equals(redisTemplate.hasKey(LOCK_PREFIX + idempotencyKey))
-                || Boolean.TRUE.equals(redisTemplate.hasKey(PREFIX + idempotencyKey));
+    // Mirrors DB constraint UNIQUE (user_id, idempotency_key)
+    private static String lockKey(UUID userId, String idempotencyKey) {
+        return LOCK_PREFIX + userId + ":" + idempotencyKey;
     }
 }

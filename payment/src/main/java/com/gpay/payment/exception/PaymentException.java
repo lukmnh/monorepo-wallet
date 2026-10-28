@@ -9,25 +9,17 @@ public class PaymentException {
         public DailyLimitExceededException(String message) { super(message); }
     }
 
-    public static class InsufficientBalanceException extends RuntimeException {
-        public InsufficientBalanceException(String message) { super(message); }
-    }
-
     public static class InvalidTransferException extends RuntimeException {
         public InvalidTransferException(String message) { super(message); }
     }
 
-    public static class TransferFailedException extends RuntimeException {
-        public TransferFailedException(String message) { super(message); }
+    public static class InvalidIdempotencyKeyException extends RuntimeException {
+        public InvalidIdempotencyKeyException(String message) { super(message); }
     }
 
-    public static class DuplicateRequestException extends RuntimeException {
-        private final Object cachedResponse;
-        public DuplicateRequestException(String message, Object cachedResponse) {
-            super(message);
-            this.cachedResponse = cachedResponse;
-        }
-        public Object getCachedResponse() { return cachedResponse; }
+    /** Same idempotency key re-sent with a different request (other type or amount). */
+    public static class IdempotencyKeyReusedException extends RuntimeException {
+        public IdempotencyKeyReusedException(String message) { super(message); }
     }
 
     public static class WebhookException extends RuntimeException {

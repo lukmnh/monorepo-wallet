@@ -2,6 +2,7 @@ package com.gpay.wallets.entity;
 
 import jakarta.persistence.*;
 import lombok.*;
+import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
 
 import java.math.BigDecimal;
@@ -27,14 +28,14 @@ public class Wallets {
     @Builder.Default
     private BigDecimal balance = BigDecimal.ZERO;
 
+    // Must stay null on new instances: Spring Data treats version == null as "new" => persist(), not merge()
     @Version
     @Column(nullable = false)
-    @Builder.Default
-    private Long version = 0L;
+    private Long version;
 
+    @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
-    @Builder.Default
-    private LocalDateTime createdAt = LocalDateTime.now();
+    private LocalDateTime createdAt;
 
     @UpdateTimestamp
     @Column(name = "updated_at", nullable = false)

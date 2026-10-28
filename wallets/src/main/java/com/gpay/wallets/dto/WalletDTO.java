@@ -2,6 +2,7 @@ package com.gpay.wallets.dto;
 
 import com.gpay.wallets.constant.Type;
 import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.NotNull;
 
 import java.math.BigDecimal;
@@ -29,7 +30,8 @@ public class WalletDTO {
 
     public record CreditDebitRequest(
             @NotNull UUID userId,
-            @NotNull @DecimalMin(value = "0.01", message = "Amount must be positive") BigDecimal amount,
+            @NotNull @DecimalMin(value = "0.01", message = "Amount must be positive")
+            @Digits(integer = 17, fraction = 2, message = "Amount must have at most 2 decimal places") BigDecimal amount,
             String referenceId,
             String description
     ) {}
@@ -37,7 +39,8 @@ public class WalletDTO {
     public record AtomicTransferRequest(
             @NotNull UUID fromUserId,
             @NotNull UUID toUserId,
-            @NotNull @DecimalMin(value = "0.01") BigDecimal amount,
+            @NotNull @DecimalMin(value = "0.01")
+            @Digits(integer = 17, fraction = 2, message = "Amount must have at most 2 decimal places") BigDecimal amount,
             String referenceId,
             String description
     ) {}
